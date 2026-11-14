@@ -1,0 +1,11 @@
+User-agent: *
+Allow: /
+
+User-agent: Googlebot
+Allow: /
+
+User-agent: Yandex
+Allow: /
+
+Host: https://dimiy7805-ship-it.github.io
+Sitemap: https://dimiy7805-ship-it.github.io/door/sitemap.xml

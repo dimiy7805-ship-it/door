@@ -439,5 +439,35 @@ export function sanitizeChatMessage(raw: unknown): string | null {
   return cleaned.slice(0, 280);
 }
 
+export const PUBLIC_SITE_URL = 'https://dimiy7805-ship-it.github.io/door/';
+
+/**
+ * Resolves the canonical shareable URL for the intercom app when the user clicks the brand title.
+ * On GitHub Pages or custom production domains, returns the clean origin + pathname with trailing slash;
+ * in local dev or temporary preview containers, returns the official GitHub Pages deployment URL.
+ */
+export function resolveShareableSiteUrl(currentHref?: string | null): string {
+  if (!currentHref) return PUBLIC_SITE_URL;
+  try {
+    const parsed = new URL(currentHref);
+    const host = parsed.hostname.toLowerCase();
+    if (
+      host === 'localhost' ||
+      host === '127.0.0.1' ||
+      host.endsWith('.run.app') ||
+      host.endsWith('.usercontent.goog')
+    ) {
+      return PUBLIC_SITE_URL;
+    }
+    if (host === 'dimiy7805-ship-it.github.io') {
+      return PUBLIC_SITE_URL;
+    }
+    const cleanPath = parsed.pathname.endsWith('/') ? parsed.pathname : `${parsed.pathname}/`;
+    return `${parsed.origin}${cleanPath}`;
+  } catch {
+    return PUBLIC_SITE_URL;
+  }
+}
+
 
 

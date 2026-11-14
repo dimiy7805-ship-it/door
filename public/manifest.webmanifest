@@ -1,0 +1,19 @@
+{
+  "name": "Домофон Линия — 3D Видеодомофон и Рулетка",
+  "short_name": "Домофон.Линия",
+  "description": "Бесплатная домофон рулетка, домофон видеорулетка и видеозвонки по коду онлайн в формате реалистичного 3D домофона.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0c0d0e",
+  "theme_color": "#0c0d0e",
+  "lang": "ru",
+  "icons": [
+    {
+      "src": "./favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

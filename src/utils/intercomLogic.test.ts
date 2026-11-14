@@ -11,6 +11,8 @@ import {
   cycleRemoteRotationMode,
   formatRotationLabel,
   resolveEffectiveRotation,
+  PUBLIC_SITE_URL,
+  resolveShareableSiteUrl,
 } from './intercomLogic';
 
 test('validatePin accepts 1 to 5 digits without leading zero', () => {
@@ -194,4 +196,13 @@ test('cycleRemoteRotationMode and formatRotationLabel cycle through auto and 90-
   assert.equal(resolveEffectiveRotation(90, 1280, 720, 512, 320, true), 0);
   assert.equal(resolveEffectiveRotation('auto', 1280, 720, 512, 320, true), 0);
 });
+
+test('resolveShareableSiteUrl returns clean GitHub Pages URL or custom production URL', () => {
+  assert.equal(resolveShareableSiteUrl(), PUBLIC_SITE_URL);
+  assert.equal(resolveShareableSiteUrl('http://localhost:3000/?serverless=1#top'), 'https://dimiy7805-ship-it.github.io/door/');
+  assert.equal(resolveShareableSiteUrl('https://dimiy7805-ship-it.github.io/door/#top'), 'https://dimiy7805-ship-it.github.io/door/');
+  assert.equal(resolveShareableSiteUrl('https://dimiy7805-ship-it.github.io/door'), 'https://dimiy7805-ship-it.github.io/door/');
+  assert.equal(resolveShareableSiteUrl('https://domofon.example.com/app?foo=bar'), 'https://domofon.example.com/app/');
+});
+
 

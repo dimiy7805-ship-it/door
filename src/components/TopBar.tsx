@@ -1,6 +1,6 @@
-import React from 'react';
-import { HelpCircle } from 'lucide-react';
-import { IntercomBrand } from '../utils/intercomLogic';
+import React, { useState, useRef, useEffect } from 'react';
+import { HelpCircle, Check } from 'lucide-react';
+import { IntercomBrand, resolveShareableSiteUrl } from '../utils/intercomLogic';
 
 interface TopBarProps {
   brand: IntercomBrand;
@@ -9,6 +9,7 @@ interface TopBarProps {
   onlineCount: number;
   onOpenPinModal: () => void;
   onOpenHelpModal: () => void;
+  onCopyLink?: () => void;
 }
 
 const BRANDS: { id: IntercomBrand; label: string; shortLabel: string }[] = [
@@ -17,6 +18,36 @@ const BRANDS: { id: IntercomBrand; label: string; shortLabel: string }[] = [
   { id: 'cyfral', label: 'CYFRAL CCD-2094', shortLabel: 'CYFRAL' },
 ];
 
+async function copyTextToClipboard(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // Fallback below if Clipboard API is restricted in iframe/context
+  }
+
+  try {
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.top = '-9999px';
+    textarea.style.left = '-9999px';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+    textarea.setSelectionRange(0, text.length);
+    const ok = document.execCommand('copy');
+    document.body.removeChild(textarea);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
 export const TopBar: React.FC<TopBarProps> = ({
   brand,
   onSelectBrand,
@@ -24,15 +55,49 @@ export const TopBar: React.FC<TopBarProps> = ({
   onlineCount,
   onOpenPinModal,
   onOpenHelpModal,
+  onCopyLink,
 }) => {
+  const [copiedLink, setCopiedLink] = useState(false);
+  const copyTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+      }
+    };
+  }, []);
+
+  const handleCopyBrandLink = async () => {
+    onCopyLink?.();
+    const urlToCopy = resolveShareableSiteUrl(
+      typeof window !== 'undefined' ? window.location.href : undefined
+    );
+    await copyTextToClipboard(urlToCopy);
+    setCopiedLink(true);
+    if (copyTimerRef.current !== null) {
+      window.clearTimeout(copyTimerRef.current);
+    }
+    copyTimerRef.current = window.setTimeout(() => {
+      setCopiedLink(false);
+      copyTimerRef.current = null;
+    }, 2200);
+  };
+
   return (
     <header className="fixed top-0 left-0 right-0 z-20 flex items-center justify-between gap-2 sm:gap-6 px-3 sm:px-6 py-2.5 bg-[#101215] border-b border-[#22252b]">
-      {/* Zone 1: Brand Title — "ДОМОФОН.ЛИНИЯ" on PC with larger dot separator, "ДОМОФОН" on mobile */}
-      <a
-        href="#top"
-        onClick={(e) => e.preventDefault()}
+      {/* Zone 1: Brand Title — "ДОМОФОН.ЛИНИЯ" on PC with larger dot separator, "ДОМОФОН" on mobile; click copies site URL */}
+      <button
+        type="button"
+        onClick={handleCopyBrandLink}
         data-testid="brand-title"
-        className="font-brand text-xs sm:text-[15px] font-extrabold text-[#f1f3f5] whitespace-nowrap shrink-0 select-none flex items-baseline"
+        title="Нажмите, чтобы скопировать ссылку на домофон"
+        aria-label={
+          copiedLink
+            ? 'Ссылка на домофон скопирована'
+            : 'Домофон.Линия — скопировать ссылку на домофон'
+        }
+        className="group relative font-brand text-xs sm:text-[15px] font-extrabold text-[#f1f3f5] hover:text-white active:scale-[0.98] transition-all whitespace-nowrap shrink-0 select-none flex items-center gap-1.5 cursor-pointer bg-transparent border-0 p-0 text-left"
       >
         <span data-testid="brand-title-pc" className="hidden sm:inline-flex items-baseline">
           <span>ДОМОФОН</span>
@@ -47,7 +112,20 @@ export const TopBar: React.FC<TopBarProps> = ({
         <span data-testid="brand-title-mobile" className="sm:hidden">
           ДОМОФОН
         </span>
-      </a>
+
+        {copiedLink && (
+          <span
+            data-testid="brand-copied-badge"
+            role="status"
+            aria-live="polite"
+            className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] sm:text-[11px] font-sans font-semibold text-[#8ce99a] bg-[#16281c] border border-[#2b5237] rounded transition-opacity"
+          >
+            <Check className="w-3 h-3 shrink-0" />
+            <span className="hidden md:inline">Ссылка скопирована</span>
+            <span className="md:hidden">Скопировано</span>
+          </span>
+        )}
+      </button>
 
       {/* Zone 2: Centered model switcher buttons */}
       <nav
