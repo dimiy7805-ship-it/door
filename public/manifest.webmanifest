@@ -1,19 +1,40 @@
 {
+  "id": "./",
   "name": "Домофон Линия — 3D Видеодомофон и Рулетка",
-  "short_name": "Домофон.Линия",
+  "short_name": "Домофон",
   "description": "Бесплатная домофон рулетка, домофон видеорулетка и видеозвонки по коду онлайн в формате реалистичного 3D домофона.",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
+  "orientation": "any",
   "background_color": "#0c0d0e",
   "theme_color": "#0c0d0e",
   "lang": "ru",
+  "categories": ["social", "communication", "entertainment"],
   "icons": [
+    {
+      "src": "./pwa-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "./pwa-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "./pwa-maskable-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
     {
       "src": "./favicon.svg",
       "sizes": "any",
       "type": "image/svg+xml",
-      "purpose": "any maskable"
+      "purpose": "any"
     }
   ]
 }
