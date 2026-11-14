@@ -1,0 +1,6 @@
+{
+  "name": "Домофон Линия — 3D Видеодомофон и Рулетка",
+  "description": "Минималистичная видео-рулетка и прямые видеозвонки по личному коду в формате 3D домофона без регистрации.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
