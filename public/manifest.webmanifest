@@ -2,12 +2,12 @@
   "id": "./",
   "name": "Домофон Линия — 3D Видеодомофон и Рулетка",
   "short_name": "Домофон",
-  "description": "Бесплатная домофон рулетка, домофон видеорулетка и видеозвонки по коду онлайн в формате реалистичного 3D домофона.",
+  "description": "Интерактивный 3D видеодомофон онлайн (ELTIS DP400, VIZIT BVD-343, CYFRAL CCD-2094): прямые видеозвонки по коду квартиры и режим домофон-рулетки в браузере.",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
   "orientation": "any",
-  "background_color": "#0c0d0e",
+  "background_color": "#ffffff",
   "theme_color": "#0c0d0e",
   "lang": "ru",
   "categories": ["social", "communication", "entertainment"],
@@ -29,12 +29,6 @@
       "sizes": "512x512",
       "type": "image/png",
       "purpose": "maskable"
-    },
-    {
-      "src": "./favicon.svg",
-      "sizes": "any",
-      "type": "image/svg+xml",
-      "purpose": "any"
     }
   ]
 }

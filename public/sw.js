@@ -1,10 +1,11 @@
-const CACHE_NAME = 'domofon-line-pwa-v1';
+const CACHE_NAME = 'domofon-line-pwa-v2';
 const SHELL_ASSETS = [
   './',
   './index.html',
   './manifest.webmanifest',
-  './favicon.svg',
+  './favicon.png',
   './favicon.ico',
+  './apple-touch-icon.png',
   './pwa-192x192.png',
   './pwa-512x512.png',
 ];
