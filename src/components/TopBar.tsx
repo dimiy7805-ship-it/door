@@ -87,45 +87,47 @@ export const TopBar: React.FC<TopBarProps> = ({
   return (
     <header className="fixed top-0 left-0 right-0 z-20 flex items-center justify-between gap-2 sm:gap-6 px-3 sm:px-6 py-2.5 bg-[#101215] border-b border-[#22252b]">
       {/* Zone 1: Brand Title — "ДОМОФОН.ЛИНИЯ" on PC with larger dot separator, "ДОМОФОН" on mobile; click copies site URL */}
-      <button
-        type="button"
-        onClick={handleCopyBrandLink}
-        data-testid="brand-title"
-        title="Нажмите, чтобы скопировать ссылку на домофон"
-        aria-label={
-          copiedLink
-            ? 'Ссылка на домофон скопирована'
-            : 'Домофон.Линия — скопировать ссылку на домофон'
-        }
-        className="group relative font-brand text-xs sm:text-[15px] font-extrabold text-[#f1f3f5] hover:text-white active:scale-[0.98] transition-all whitespace-nowrap shrink-0 select-none flex items-center gap-1.5 cursor-pointer bg-transparent border-0 p-0 text-left"
-      >
-        <span data-testid="brand-title-pc" className="hidden sm:inline-flex items-baseline">
-          <span>ДОМОФОН</span>
-          <span
-            data-testid="brand-dot-separator"
-            className="inline-block text-[22px] font-black leading-none text-[#8ce99a] mx-[2px] -translate-y-[0.5px]"
-          >
-            .
+      <h1 className="m-0 p-0 text-xs sm:text-[15px] font-extrabold leading-none shrink-0">
+        <button
+          type="button"
+          onClick={handleCopyBrandLink}
+          data-testid="brand-title"
+          title="Нажмите, чтобы скопировать ссылку на домофон"
+          aria-label={
+            copiedLink
+              ? 'Ссылка на домофон скопирована'
+              : 'Домофон.Линия — скопировать ссылку на домофон'
+          }
+          className="group relative font-brand text-xs sm:text-[15px] font-extrabold text-[#f1f3f5] hover:text-white active:scale-[0.98] transition-all whitespace-nowrap shrink-0 select-none flex items-center gap-1.5 cursor-pointer bg-transparent border-0 p-0 text-left"
+        >
+          <span data-testid="brand-title-pc" className="hidden sm:inline-flex items-baseline">
+            <span>ДОМОФОН</span>
+            <span
+              data-testid="brand-dot-separator"
+              className="inline-block text-[22px] font-black leading-none text-[#8ce99a] mx-[2px] -translate-y-[0.5px]"
+            >
+              .
+            </span>
+            <span>ЛИНИЯ</span>
           </span>
-          <span>ЛИНИЯ</span>
-        </span>
-        <span data-testid="brand-title-mobile" className="sm:hidden">
-          ДОМОФОН
-        </span>
+          <span data-testid="brand-title-mobile" className="sm:hidden">
+            ДОМОФОН
+          </span>
 
-        {copiedLink && (
-          <span
-            data-testid="brand-copied-badge"
-            role="status"
-            aria-live="polite"
-            className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] sm:text-[11px] font-sans font-semibold text-[#8ce99a] bg-[#16281c] border border-[#2b5237] rounded transition-opacity"
-          >
-            <Check className="w-3 h-3 shrink-0" />
-            <span className="hidden md:inline">Ссылка скопирована</span>
-            <span className="md:hidden">Скопировано</span>
-          </span>
-        )}
-      </button>
+          {copiedLink && (
+            <span
+              data-testid="brand-copied-badge"
+              role="status"
+              aria-live="polite"
+              className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] sm:text-[11px] font-sans font-semibold text-[#8ce99a] bg-[#16281c] border border-[#2b5237] rounded transition-opacity"
+            >
+              <Check className="w-3 h-3 shrink-0" />
+              <span className="hidden md:inline">Ссылка скопирована</span>
+              <span className="md:hidden">Скопировано</span>
+            </span>
+          )}
+        </button>
+      </h1>
 
       {/* Zone 2: Centered model switcher buttons */}
       <nav
