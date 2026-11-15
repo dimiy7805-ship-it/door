@@ -1,6 +1,6 @@
 {
   "name": "Домофон Линия — 3D Видеодомофон и Рулетка",
-  "description": "Домофон Линия — бесплатная домофон рулетка, домофон видеорулетка и видеозвонки по коду онлайн. Реалистичный 3D домофон ELTIS, VIZIT и CYFRAL в браузере без регистрации.",
+  "description": "Интерактивный 3D видеодомофон онлайн (ELTIS DP400, VIZIT BVD-343, CYFRAL CCD-2094): прямые видеозвонки по коду квартиры и режим домофон-рулетки в браузере.",
   "requestFramePermissions": ["camera", "microphone"],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
