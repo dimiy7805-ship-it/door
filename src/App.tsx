@@ -25,8 +25,19 @@ const RTC_CONFIG: RTCConfiguration = {
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:stun2.l.google.com:19302' },
-    { urls: 'stun:stun3.l.google.com:19302' },
+    { urls: 'stun:stun.cloudflare.com:3478' },
+    {
+      urls: [
+        'turn:openrelay.metered.ca:80',
+        'turn:openrelay.metered.ca:443',
+        'turn:openrelay.metered.ca:443?transport=tcp',
+        'turns:openrelay.metered.ca:443?transport=tcp',
+      ],
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    },
   ],
+  iceCandidatePoolSize: 4,
 };
 
 const LEASE_TTL_MS = 4500;
@@ -533,18 +544,29 @@ export default function App() {
         }
       }
 
+      const isServerless = wsRef.current?.mode === 'serverless';
+      const now = Date.now();
+      if (isServerless) {
+        const minInterval = webrtcConnectedRef.current ? 2500 : 280;
+        if (now - lastFallbackFrameSentAt < minInterval) {
+          return;
+        }
+      }
+      lastFallbackFrameSentAt = now;
+
       const capCanvas = captureCanvasRef.current;
       if (!capCanvas) return;
       const ctx = capCanvas.getContext('2d');
       if (!ctx) return;
 
+      const maxDim = isServerless ? 260 : 480;
       const videoEl = localVideoRef.current;
       if (camEnabledRef.current && videoEl && videoEl.readyState >= 2) {
         const vw = videoEl.videoWidth || 480;
         const vh = videoEl.videoHeight || 360;
-        const scale = Math.min(1, 480 / Math.max(vw, vh));
-        const targetW = Math.max(160, Math.round(vw * scale));
-        const targetH = Math.max(120, Math.round(vh * scale));
+        const scale = Math.min(1, maxDim / Math.max(vw, vh));
+        const targetW = Math.max(140, Math.round(vw * scale));
+        const targetH = Math.max(105, Math.round(vh * scale));
         if (capCanvas.width !== targetW || capCanvas.height !== targetH) {
           capCanvas.width = targetW;
           capCanvas.height = targetH;
@@ -553,21 +575,21 @@ export default function App() {
         ctx.imageSmoothingQuality = 'high';
         ctx.drawImage(videoEl, 0, 0, targetW, targetH);
       } else {
-        capCanvas.width = 480;
-        capCanvas.height = 360;
+        capCanvas.width = 320;
+        capCanvas.height = 240;
         ctx.fillStyle = '#101216';
-        ctx.fillRect(0, 0, 480, 360);
+        ctx.fillRect(0, 0, 320, 240);
         ctx.fillStyle = '#d5d8de';
-        ctx.font = '700 24px "JetBrains Mono", monospace';
+        ctx.font = '700 20px "JetBrains Mono", monospace';
         ctx.textAlign = 'center';
-        ctx.fillText(`PIN #${myPinRef.current || '---'}`, 240, 165);
+        ctx.fillText(`PIN #${myPinRef.current || '---'}`, 160, 110);
         ctx.fillStyle = '#7c828d';
-        ctx.font = '600 15px "JetBrains Mono", monospace';
-        ctx.fillText(camEnabledRef.current ? 'AUDIO ACTIVE' : 'CAMERA OFF', 240, 200);
+        ctx.font = '600 13px "JetBrains Mono", monospace';
+        ctx.fillText(camEnabledRef.current ? 'AUDIO ACTIVE' : 'CAMERA OFF', 160, 140);
       }
 
       try {
-        const dataUrl = capCanvas.toDataURL('image/jpeg', 0.72);
+        const dataUrl = capCanvas.toDataURL('image/jpeg', isServerless ? 0.52 : 0.72);
         sendWs({
           type: 'media:frame',
           frame: dataUrl,
@@ -578,6 +600,8 @@ export default function App() {
         // Ignore
       }
     };
+
+    let lastFallbackFrameSentAt = 0;
 
     sendWs({
       type: 'media:state',
