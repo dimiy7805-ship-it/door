@@ -153,6 +153,8 @@ export default function App() {
   const autoDialTimeoutsRef = useRef<number[]>([]);
   const toastTimeoutRef = useRef<number | null>(null);
   const webrtcConnectedRef = useRef<boolean>(false);
+  const pendingIceCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+  const webrtcOfferRetryTimerRef = useRef<number | null>(null);
   const baselinePeerIsPortraitRef = useRef<boolean | null>(null);
 
   const brandRef = useRef(brand);
@@ -419,13 +421,31 @@ export default function App() {
   }, []);
 
 
+  const flushPendingIceCandidates = useCallback(async (pc: RTCPeerConnection) => {
+    if (!pc.remoteDescription || !pc.remoteDescription.type) return;
+    const queued = pendingIceCandidatesRef.current.splice(0, pendingIceCandidatesRef.current.length);
+    for (const cand of queued) {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(cand));
+      } catch {
+        // Ignore duplicate or invalid candidate
+      }
+    }
+  }, []);
+
   const closePeerConnection = useCallback(() => {
     webrtcConnectedRef.current = false;
+    pendingIceCandidatesRef.current = [];
+    if (webrtcOfferRetryTimerRef.current !== null) {
+      window.clearTimeout(webrtcOfferRetryTimerRef.current);
+      webrtcOfferRetryTimerRef.current = null;
+    }
     if (pcRef.current) {
       try {
         pcRef.current.onicecandidate = null;
         pcRef.current.ontrack = null;
         pcRef.current.onconnectionstatechange = null;
+        pcRef.current.oniceconnectionstatechange = null;
         pcRef.current.close();
       } catch {
         // Ignore
@@ -443,8 +463,12 @@ export default function App() {
 
   const startWebRtcSession = useCallback(
     async (initiator: boolean) => {
+      // If receiver already created an RTCPeerConnection upon receiving an early webrtc:offer, do NOT destroy it!
+      if (!initiator && pcRef.current && pcRef.current.signalingState !== 'closed') {
+        return pcRef.current;
+      }
+
       closePeerConnection();
-      const stream = await ensureLocalMedia();
 
       try {
         const pc = new RTCPeerConnection(RTC_CONFIG);
@@ -453,24 +477,28 @@ export default function App() {
         const combinedRemote = new MediaStream();
         remoteStreamRef.current = combinedRemote;
 
-        if (stream) {
-          stream.getTracks().forEach((track) => {
-            pc.addTrack(track, stream);
-          });
-        }
+        const updateConnectedState = () => {
+          if (pcRef.current !== pc) return;
+          const isConn =
+            pc.connectionState === 'connected' ||
+            pc.iceConnectionState === 'connected' ||
+            pc.iceConnectionState === 'completed';
+          webrtcConnectedRef.current = isConn;
+          if (isConn) {
+            unlockRemoteAudioElements();
+          }
+        };
+
+        pc.onconnectionstatechange = updateConnectedState;
+        pc.oniceconnectionstatechange = updateConnectedState;
 
         pc.onicecandidate = (event) => {
-          if (event.candidate) {
+          if (event.candidate && pcRef.current === pc) {
             sendWs({
               type: 'webrtc:ice',
               candidate: event.candidate,
             });
           }
-        };
-
-        pc.onconnectionstatechange = () => {
-          webrtcConnectedRef.current =
-            pc.connectionState === 'connected' || pc.iceConnectionState === 'connected';
         };
 
         pc.ontrack = (event) => {
@@ -496,7 +524,26 @@ export default function App() {
           }
         };
 
-        if (initiator) {
+        const stream = await ensureLocalMedia();
+        if (pcRef.current !== pc || pc.signalingState === 'closed') {
+          return pcRef.current;
+        }
+
+        if (stream) {
+          const existingTrackIds = new Set(
+            pc
+              .getSenders()
+              .map((s) => s.track?.id)
+              .filter(Boolean)
+          );
+          stream.getTracks().forEach((track) => {
+            if (!existingTrackIds.has(track.id)) {
+              pc.addTrack(track, stream);
+            }
+          });
+        }
+
+        if (initiator && pc.signalingState === 'stable') {
           const offer = await pc.createOffer({
             offerToReceiveAudio: true,
             offerToReceiveVideo: true,
@@ -506,12 +553,33 @@ export default function App() {
             type: 'webrtc:offer',
             sdp: pc.localDescription,
           });
+
+          // Re-send bundled SDP offer (with gathered STUN/TURN candidates) after 950ms and 2600ms if not yet connected
+          webrtcOfferRetryTimerRef.current = window.setTimeout(() => {
+            if (pcRef.current === pc && !webrtcConnectedRef.current && pc.localDescription) {
+              sendWs({
+                type: 'webrtc:offer',
+                sdp: pc.localDescription,
+              });
+              webrtcOfferRetryTimerRef.current = window.setTimeout(() => {
+                if (pcRef.current === pc && !webrtcConnectedRef.current && pc.localDescription) {
+                  sendWs({
+                    type: 'webrtc:offer',
+                    sdp: pc.localDescription,
+                  });
+                }
+              }, 1650);
+            }
+          }, 950);
         }
+
+        return pc;
       } catch {
         // Frame relay fallback handles video even if RTCPeerConnection fails
+        return null;
       }
     },
-    [closePeerConnection, ensureLocalMedia, sendWs]
+    [closePeerConnection, ensureLocalMedia, sendWs, unlockRemoteAudioElements]
   );
 
   // High-FPS, aspect-preserving video frame & voice audio fallback relay while connected
@@ -528,6 +596,12 @@ export default function App() {
     const sendFrameNow = () => {
       const remVideo = remoteVideoRef.current;
       const remCanvas = remoteCanvasDisplayRef.current;
+      const hasLiveWebRtcVideo = Boolean(
+        webrtcConnectedRef.current &&
+          remVideo &&
+          remVideo.readyState >= 2 &&
+          remVideo.videoWidth > 0
+      );
 
       if (remVideo && remVideo.readyState >= 2 && remVideo.videoWidth > 0 && remCanvas) {
         if (
@@ -547,7 +621,7 @@ export default function App() {
       const isServerless = wsRef.current?.mode === 'serverless';
       const now = Date.now();
       if (isServerless) {
-        const minInterval = webrtcConnectedRef.current ? 2500 : 280;
+        const minInterval = hasLiveWebRtcVideo ? 2500 : 230;
         if (now - lastFallbackFrameSentAt < minInterval) {
           return;
         }
@@ -559,14 +633,14 @@ export default function App() {
       const ctx = capCanvas.getContext('2d');
       if (!ctx) return;
 
-      const maxDim = isServerless ? 260 : 480;
+      const maxDim = isServerless ? 240 : 480;
       const videoEl = localVideoRef.current;
       if (camEnabledRef.current && videoEl && videoEl.readyState >= 2) {
         const vw = videoEl.videoWidth || 480;
         const vh = videoEl.videoHeight || 360;
         const scale = Math.min(1, maxDim / Math.max(vw, vh));
-        const targetW = Math.max(140, Math.round(vw * scale));
-        const targetH = Math.max(105, Math.round(vh * scale));
+        const targetW = Math.max(130, Math.round(vw * scale));
+        const targetH = Math.max(98, Math.round(vh * scale));
         if (capCanvas.width !== targetW || capCanvas.height !== targetH) {
           capCanvas.width = targetW;
           capCanvas.height = targetH;
@@ -589,7 +663,7 @@ export default function App() {
       }
 
       try {
-        const dataUrl = capCanvas.toDataURL('image/jpeg', isServerless ? 0.52 : 0.72);
+        const dataUrl = capCanvas.toDataURL('image/jpeg', isServerless ? 0.5 : 0.72);
         sendWs({
           type: 'media:frame',
           frame: dataUrl,
@@ -615,46 +689,73 @@ export default function App() {
     let audioCtx: AudioContext | null = null;
     let processor: ScriptProcessorNode | null = null;
     let sourceNode: MediaStreamAudioSourceNode | null = null;
+    let cancelled = false;
 
-    try {
-      const stream = localStreamRef.current;
-      const audioTracks = stream ? stream.getAudioTracks() : [];
-      if (audioTracks.length > 0) {
+    const setupFallbackAudioCapture = async () => {
+      try {
+        let stream = localStreamRef.current;
+        if (!stream || stream.getAudioTracks().length === 0) {
+          stream = await ensureLocalMedia();
+        }
+        if (cancelled || !stream) return;
+        const audioTracks = stream.getAudioTracks();
+        if (audioTracks.length === 0) return;
+
         const AudioCtx =
           window.AudioContext ||
           (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-        if (AudioCtx) {
-          audioCtx = new AudioCtx({ sampleRate: 16000 });
-          sourceNode = audioCtx.createMediaStreamSource(new MediaStream([audioTracks[0]]));
-          processor = audioCtx.createScriptProcessor(2048, 1, 1);
-          processor.onaudioprocess = (e) => {
-            if (!micEnabledRef.current || webrtcConnectedRef.current) return;
-            const input = e.inputBuffer.getChannelData(0);
-            let sum = 0;
-            for (let i = 0; i < input.length; i += 4) {
-              sum += Math.abs(input[i]);
-            }
-            if (sum / (input.length / 4) < 0.004) return;
+        if (!AudioCtx) return;
 
-            const quantized = new Array(input.length);
-            for (let i = 0; i < input.length; i++) {
-              quantized[i] = Math.round(input[i] * 1000) / 1000;
-            }
-            sendWs({
-              type: 'media:audio',
-              samples: quantized,
-              rate: audioCtx?.sampleRate || 16000,
-            });
-          };
-          sourceNode.connect(processor);
-          processor.connect(audioCtx.destination);
+        // Use native hardware sample rate so mobile Safari / Android Chrome never throw NotSupportedError
+        audioCtx = new AudioCtx();
+        if (audioCtx.state === 'suspended') {
+          audioCtx.resume().catch(() => {});
         }
+        const inRate = audioCtx.sampleRate || 48000;
+        const targetRate = 12000;
+        const step = Math.max(1, inRate / targetRate);
+
+        sourceNode = audioCtx.createMediaStreamSource(new MediaStream([audioTracks[0]]));
+        processor = audioCtx.createScriptProcessor(4096, 1, 1);
+        processor.onaudioprocess = (e) => {
+          if (!micEnabledRef.current) return;
+          const hasLiveWebRtcAudio = Boolean(
+            webrtcConnectedRef.current &&
+              remoteStreamRef.current &&
+              remoteStreamRef.current.getAudioTracks().some((t) => t.readyState === 'live')
+          );
+          if (hasLiveWebRtcAudio) return;
+
+          const input = e.inputBuffer.getChannelData(0);
+          let sum = 0;
+          for (let i = 0; i < input.length; i += 4) {
+            sum += Math.abs(input[i]);
+          }
+          if (sum / (input.length / 4) < 0.003) return;
+
+          const outLen = Math.floor(input.length / step);
+          const quantized = new Array(outLen);
+          for (let i = 0; i < outLen; i++) {
+            const sample = input[Math.min(input.length - 1, Math.floor(i * step))];
+            quantized[i] = Math.round(sample * 1000) / 1000;
+          }
+          sendWs({
+            type: 'media:audio',
+            samples: quantized,
+            rate: Math.round(inRate / step),
+          });
+        };
+        sourceNode.connect(processor);
+        processor.connect(audioCtx.destination);
+      } catch {
+        // Ignore fallback audio errors
       }
-    } catch {
-      // Ignore fallback audio errors
-    }
+    };
+
+    setupFallbackAudioCapture();
 
     return () => {
+      cancelled = true;
       window.clearInterval(timer);
       try {
         processor?.disconnect();
@@ -664,7 +765,7 @@ export default function App() {
         // Ignore
       }
     };
-  }, [callState, sendWs]);
+  }, [callState, ensureLocalMedia, sendWs]);
 
   // Connect to WebSocket server with unthrottled background heartbeat & instant tab/browser wakeup recovery
   useEffect(() => {
@@ -995,17 +1096,29 @@ export default function App() {
             try {
               let pc = pcRef.current;
               if (!pc || pc.signalingState === 'closed') {
-                await startWebRtcSession(false);
-                pc = pcRef.current;
+                pc = await startWebRtcSession(false);
               }
               if (pc && msg.sdp) {
+                if (pc.signalingState === 'have-local-offer') {
+                  await pc.setLocalDescription({ type: 'rollback' } as RTCSessionDescriptionInit);
+                }
                 await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+                await flushPendingIceCandidates(pc);
                 const answer = await pc.createAnswer();
                 await pc.setLocalDescription(answer);
                 sendWs({
                   type: 'webrtc:answer',
                   sdp: pc.localDescription,
                 });
+                // Also re-send bundled answer with gathered STUN/TURN candidates after 800ms
+                window.setTimeout(() => {
+                  if (pcRef.current === pc && !webrtcConnectedRef.current && pc.localDescription) {
+                    sendWs({
+                      type: 'webrtc:answer',
+                      sdp: pc.localDescription,
+                    });
+                  }
+                }, 800);
               }
             } catch {
               // Ignore
@@ -1016,8 +1129,14 @@ export default function App() {
           case 'webrtc:answer': {
             try {
               const pc = pcRef.current;
-              if (pc && msg.sdp && pc.signalingState !== 'stable') {
-                await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+              if (pc && msg.sdp) {
+                if (
+                  pc.signalingState === 'have-local-offer' ||
+                  pc.signalingState === 'have-remote-pranswer'
+                ) {
+                  await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+                }
+                await flushPendingIceCandidates(pc);
               }
             } catch {
               // Ignore
@@ -1027,8 +1146,11 @@ export default function App() {
 
           case 'webrtc:ice': {
             try {
+              if (!msg.candidate) break;
               const pc = pcRef.current;
-              if (pc && msg.candidate) {
+              if (!pc || !pc.remoteDescription || !pc.remoteDescription.type) {
+                pendingIceCandidatesRef.current.push(msg.candidate);
+              } else {
                 await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
               }
             } catch {
@@ -1061,8 +1183,13 @@ export default function App() {
           }
 
           case 'media:audio': {
-            if (!webrtcConnectedRef.current && Array.isArray(msg.samples)) {
-              soundEngine.playPcmFloat32Chunk(msg.samples, Number(msg.rate) || 16000);
+            const hasLiveWebRtcAudio = Boolean(
+              webrtcConnectedRef.current &&
+                remoteStreamRef.current &&
+                remoteStreamRef.current.getAudioTracks().some((t) => t.readyState === 'live')
+            );
+            if (!hasLiveWebRtcAudio && Array.isArray(msg.samples)) {
+              soundEngine.playPcmFloat32Chunk(msg.samples, Number(msg.rate) || 12000);
             }
             break;
           }
@@ -1230,6 +1357,7 @@ export default function App() {
     closePeerConnection,
     drawFrameToRemoteCanvas,
     ensureLocalMedia,
+    flushPendingIceCandidates,
     resetCallChat,
     sendWs,
     startWebRtcSession,

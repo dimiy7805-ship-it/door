@@ -1783,9 +1783,6 @@ export const IntercomScene3D: React.FC<IntercomScene3DProps> = ({
         roughness: 0.52,
         bumpMap: optBump(darkInsertSurface.bumpMap),
         bumpScale: 0.012,
-        polygonOffset: true,
-        polygonOffsetFactor: -2,
-        polygonOffsetUnits: -2,
       });
       const upperInsert = new THREE.Mesh(
         upperInsertGeo,
@@ -1794,16 +1791,19 @@ export const IntercomScene3D: React.FC<IntercomScene3DProps> = ({
       upperInsert.position.set(0, 0.8, 0.0895);
       group.add(upperInsert);
 
-      // 3. Embedded Upper Video Screen Module (front of bezel at z = 0.103, screen at z = 0.106)
+      // 3. Embedded Upper Video Screen Module (front of bezel at z = 0.106, screen at z = 0.1075)
       const monitorOuterBezel = new THREE.Mesh(
-        new THREE.BoxGeometry(0.9, 0.48, 0.012),
+        new THREE.BoxGeometry(0.9, 0.48, 0.014),
         createMat({
           color: 0x0f1114,
           metalness: capMetal(0.75),
           roughness: 0.35,
+          polygonOffset: true,
+          polygonOffsetFactor: -1,
+          polygonOffsetUnits: -1,
         })
       );
-      monitorOuterBezel.position.set(-0.2, 0.98, 0.097);
+      monitorOuterBezel.position.set(-0.2, 0.98, 0.099);
       group.add(monitorOuterBezel);
 
       const monitorScreen = new THREE.Mesh(
@@ -1815,7 +1815,7 @@ export const IntercomScene3D: React.FC<IntercomScene3DProps> = ({
           polygonOffsetUnits: -2,
         })
       );
-      monitorScreen.position.set(-0.2, 0.98, 0.106);
+      monitorScreen.position.set(-0.2, 0.98, 0.1075);
       monitorScreensByBrand[targetBrand] = monitorScreen;
       group.add(monitorScreen);
 
@@ -1902,16 +1902,19 @@ export const IntercomScene3D: React.FC<IntercomScene3DProps> = ({
         group.add(sleevesGroup);
       }
 
-      // 6. 7-Segment LED Display Window (lower half of upper insert, bezel front at 0.103, screen at 0.106)
+      // 6. 7-Segment LED Display Window (lower half of upper insert, bezel front at 0.106, screen at 0.1075)
       const dispBezel = new THREE.Mesh(
-        new THREE.BoxGeometry(0.9, 0.3, 0.012),
+        new THREE.BoxGeometry(0.9, 0.3, 0.014),
         createMat({
           color: 0x0b0c0e,
           metalness: capMetal(0.65),
           roughness: 0.4,
+          polygonOffset: true,
+          polygonOffsetFactor: -1,
+          polygonOffsetUnits: -1,
         })
       );
-      dispBezel.position.set(-0.2, 0.53, 0.097);
+      dispBezel.position.set(-0.2, 0.53, 0.099);
       group.add(dispBezel);
 
       const dispScreen = new THREE.Mesh(
@@ -1923,7 +1926,7 @@ export const IntercomScene3D: React.FC<IntercomScene3DProps> = ({
           polygonOffsetUnits: -2,
         })
       );
-      dispScreen.position.set(-0.2, 0.53, 0.106);
+      dispScreen.position.set(-0.2, 0.53, 0.1075);
       group.add(dispScreen);
 
       // 7. RFID / Dallas Touch Memory Key Contactor
