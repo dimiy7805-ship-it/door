@@ -21,18 +21,10 @@ const WS_CLOSED = 3;
 
 const MESH_TOPIC = 'domofon-liniya-v1/room/v1';
 const NTFY_SIGNAL_TOPIC = 'domofon_liniya_v1_sig_2026';
-interface MqttBrokerConfig {
-  url: string;
-  username?: string;
-  password?: string;
-}
-
-const PUBLIC_MQTT_BROKERS: MqttBrokerConfig[] = [
-  // Primary Port-443 broker: bypasses mobile carrier (MTS/MegaFon/Beeline/Tele2) non-443 port blocks
-  { url: 'wss://public.cloud.shiftr.io:443/mqtt', username: 'public', password: 'public' },
-  { url: 'wss://broker.emqx.io:8084/mqtt' },
-  { url: 'wss://broker.hivemq.com:8884/mqtt' },
-  { url: 'wss://test.mosquitto.org:8081/mqtt' },
+const PUBLIC_MQTT_BROKERS = [
+  'wss://broker.emqx.io:8084/mqtt',
+  'wss://broker.hivemq.com:8884/mqtt',
+  'wss://test.mosquitto.org:8081/mqtt',
 ];
 
 function encodeUtf8(str: string): Uint8Array {
@@ -57,13 +49,8 @@ function encodeRemainingLength(length: number): number[] {
   return out;
 }
 
-function encodeMqttString(str: string): number[] {
-  const bytes = encodeUtf8(str);
-  return [(bytes.length >> 8) & 0xff, bytes.length & 0xff, ...bytes];
-}
-
-function buildMqttConnectPacket(clientId: string, username?: string, password?: string): Uint8Array {
-  const hasAuth = Boolean(username && password);
+function buildMqttConnectPacket(clientId: string): Uint8Array {
+  const idBytes = encodeUtf8(clientId);
   const varHeader = [
     0x00,
     0x04,
@@ -72,14 +59,11 @@ function buildMqttConnectPacket(clientId: string, username?: string, password?: 
     0x54, // 'T'
     0x54, // 'T'
     0x04, // Protocol level 4 (MQTT 3.1.1)
-    hasAuth ? 0xc2 : 0x02, // Clean session (+ username & password flags if provided)
+    0x02, // Clean session
     0x01,
     0x2c, // Keep-alive 300s (5 minutes) for backgrounded mobile/desktop tabs
   ];
-  const payload: number[] = [...encodeMqttString(clientId)];
-  if (hasAuth && username && password) {
-    payload.push(...encodeMqttString(username), ...encodeMqttString(password));
-  }
+  const payload = [(idBytes.length >> 8) & 0xff, idBytes.length & 0xff, ...idBytes];
   const remLen = varHeader.length + payload.length;
   return new Uint8Array([0x10, ...encodeRemainingLength(remLen), ...varHeader, ...payload]);
 }
@@ -197,10 +181,9 @@ class ServerlessMeshTransport implements IntercomTransport {
   private pingTimer: number | null = null;
   private seenPacketIds = new Set<string>();
   private pktSeq = 0;
-  private lastNtfyPostAt = 0;
   private lastNtfyPresencePostAt = 0;
-  private lastFrameRelayAt = 0;
-  private lastAudioRelayAt = 0;
+  private lastMediaPublishAt = 0;
+  private lastMediaRelayAt = 0;
   private closed = false;
 
   constructor() {
@@ -248,18 +231,17 @@ class ServerlessMeshTransport implements IntercomTransport {
       return;
     }
 
-    // 1. Connect to ALL public MQTT brokers simultaneously (including Port 443 shiftr.io)
-    for (const broker of PUBLIC_MQTT_BROKERS) {
-      this.connectSingleMqttBroker(broker);
+    // 1. Connect to ALL public MQTT brokers simultaneously so Wi-Fi and Mobile clients never split onto different servers
+    for (const brokerUrl of PUBLIC_MQTT_BROKERS) {
+      this.connectSingleMqttBroker(brokerUrl);
     }
 
-    // 2. Connect to Port-443 WebSocket Bridge (ntfy.sh over standard port 443)
+    // 2. Connect to Port-443 WebSocket Bridge (ntfy.sh over standard port 443) so mobile carriers blocking 8084/8884/8081 still work
     this.connectPort443Bridge();
   }
 
-  private connectSingleMqttBroker(broker: MqttBrokerConfig) {
+  private connectSingleMqttBroker(url: string) {
     if (this.closed) return;
-    const { url, username, password } = broker;
     const existing = this.mqttSockets.get(url);
     if (existing && (existing.readyState === WebSocket.OPEN || existing.readyState === WebSocket.CONNECTING)) {
       return;
@@ -271,33 +253,22 @@ class ServerlessMeshTransport implements IntercomTransport {
       this.mqttSockets.set(url, ws);
 
       let rxBuffer = new Uint8Array(0);
-      let subscribed = false;
-
-      const sendSubscribeOnce = () => {
-        if (subscribed || ws.readyState !== WebSocket.OPEN) return;
-        subscribed = true;
-        try {
-          ws.send(buildMqttSubscribePacket(MESH_TOPIC, 1).buffer as ArrayBuffer);
-          this.broadcastPresencePacket(false);
-        } catch {
-          // Ignore
-        }
-      };
 
       ws.onopen = () => {
         if (this.closed) return;
         const mqttClientId = `dl_${Math.random().toString(36).slice(2, 10)}_${Date.now() % 10000}`;
-        ws.send(buildMqttConnectPacket(mqttClientId, username, password).buffer as ArrayBuffer);
-        window.setTimeout(sendSubscribeOnce, 220);
+        ws.send(buildMqttConnectPacket(mqttClientId).buffer as ArrayBuffer);
+        window.setTimeout(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(buildMqttSubscribePacket(MESH_TOPIC, 1).buffer as ArrayBuffer);
+            this.broadcastPresencePacket(true);
+          }
+        }, 180);
       };
 
       ws.onmessage = (ev) => {
         if (!(ev.data instanceof ArrayBuffer)) return;
         const chunk = new Uint8Array(ev.data);
-        if (!subscribed && chunk.length >= 2 && (chunk[0] >> 4) === 2) {
-          // CONNACK received
-          sendSubscribeOnce();
-        }
         const merged = new Uint8Array(rxBuffer.length + chunk.length);
         merged.set(rxBuffer, 0);
         merged.set(chunk, rxBuffer.length);
@@ -319,7 +290,7 @@ class ServerlessMeshTransport implements IntercomTransport {
           this.mqttSockets.delete(url);
         }
         if (this.closed) return;
-        window.setTimeout(() => this.connectSingleMqttBroker(broker), 3500);
+        window.setTimeout(() => this.connectSingleMqttBroker(url), 3500);
       };
     } catch {
       // Ignore individual broker failure
@@ -418,19 +389,14 @@ class ServerlessMeshTransport implements IntercomTransport {
       }
     }
 
-    // Also send key control/signaling packets over ntfy.sh Port 443 (throttled to avoid HTTP 429 rate-limiting)
+    // Also send control/signaling/presence packets over standard HTTPS Port 443 so mobile carrier firewalls never block discovery or call setup
     if (
       !options?.isHighRateMedia &&
-      raw.length <= 3900 &&
       !(typeof navigator !== 'undefined' && navigator.webdriver)
     ) {
       const isPresence = payload._mesh === 'presence';
       const now = Date.now();
-      const canSendPresence = isPresence && (options?.forcePort443 || now - this.lastNtfyPresencePostAt >= 12000);
-      const canSendSignal = !isPresence && options?.forcePort443 && now - this.lastNtfyPostAt >= 180;
-
-      if (canSendPresence || canSendSignal) {
-        this.lastNtfyPostAt = now;
+      if (!isPresence || options?.forcePort443 || now - this.lastNtfyPresencePostAt >= 9500) {
         if (isPresence) {
           this.lastNtfyPresencePostAt = now;
         }
@@ -1224,29 +1190,12 @@ class ServerlessMeshTransport implements IntercomTransport {
         return;
       }
 
-      if (type === 'media:frame') {
+      if (type === 'media:frame' || type === 'media:audio') {
         const now = Date.now();
-        if (now - this.lastFrameRelayAt < 210) {
+        if (now - this.lastMediaRelayAt < 240) {
           return;
         }
-        this.lastFrameRelayAt = now;
-        this.publishWire(
-          {
-            _mesh: 'relay',
-            targetId: this.partnerClientId,
-            payload: msg,
-          },
-          { isHighRateMedia: true }
-        );
-        return;
-      }
-
-      if (type === 'media:audio') {
-        const now = Date.now();
-        if (now - this.lastAudioRelayAt < 130) {
-          return;
-        }
-        this.lastAudioRelayAt = now;
+        this.lastMediaRelayAt = now;
         this.publishWire(
           {
             _mesh: 'relay',
@@ -1264,7 +1213,7 @@ class ServerlessMeshTransport implements IntercomTransport {
           targetId: this.partnerClientId,
           payload: msg,
         },
-        { forcePort443: type !== 'webrtc:ice' }
+        { forcePort443: true }
       );
     }
   }
