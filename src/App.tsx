@@ -10,7 +10,7 @@ import {
   resolveKeypadPress,
   sanitizeChatMessage,
 } from './utils/intercomLogic';
-import { soundEngine } from './utils/soundEngine';
+import { encodePcm8Base64, soundEngine } from './utils/soundEngine';
 import { IntercomScene3D } from './components/IntercomScene3D';
 import { TopBar } from './components/TopBar';
 import { PinModal } from './components/PinModal';
@@ -29,6 +29,7 @@ const RTC_CONFIG: RTCConfiguration = {
     {
       urls: [
         'turn:openrelay.metered.ca:80',
+        'turn:openrelay.metered.ca:80?transport=tcp',
         'turn:openrelay.metered.ca:443',
         'turn:openrelay.metered.ca:443?transport=tcp',
         'turns:openrelay.metered.ca:443?transport=tcp',
@@ -143,8 +144,14 @@ export default function App() {
 
   const wsRef = useRef<IntercomTransport | null>(null);
   const pcRef = useRef<RTCPeerConnection | null>(null);
+  const pcInitPromiseRef = useRef<Promise<RTCPeerConnection | null> | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
+  const hasHardwareVideoRef = useRef<boolean>(false);
+  const hasHardwareAudioRef = useRef<boolean>(false);
+  const lastMediaRetryAtRef = useRef<number>(0);
   const remoteStreamRef = useRef<MediaStream | null>(null);
+  const remoteVideoStreamRef = useRef<MediaStream | null>(null);
+  const remoteAudioStreamRef = useRef<MediaStream | null>(null);
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
@@ -153,6 +160,10 @@ export default function App() {
   const autoDialTimeoutsRef = useRef<number[]>([]);
   const toastTimeoutRef = useRef<number | null>(null);
   const webrtcConnectedRef = useRef<boolean>(false);
+  const webrtcAudioRxRef = useRef<boolean>(false);
+  const webrtcVideoRxRef = useRef<boolean>(false);
+  const peerWebrtcAudioRxRef = useRef<boolean>(false);
+  const peerWebrtcVideoRxRef = useRef<boolean>(false);
   const pendingIceCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   const webrtcOfferRetryTimerRef = useRef<number | null>(null);
   const baselinePeerIsPortraitRef = useRef<boolean | null>(null);
@@ -223,15 +234,27 @@ export default function App() {
   }, []);
 
   const unlockRemoteAudioElements = useCallback(() => {
+    soundEngine.unlock();
+    if (remoteVideoRef.current) {
+      // Keep remoteVideoRef strictly muted so iOS Safari / Android Chrome NEVER block video decoding
+      remoteVideoRef.current.muted = true;
+      remoteVideoRef.current.play().catch(() => {});
+    }
     if (remoteAudioRef.current) {
       remoteAudioRef.current.muted = false;
       remoteAudioRef.current.volume = 1.0;
-      remoteAudioRef.current.play().catch(() => {});
-    }
-    if (remoteVideoRef.current) {
-      remoteVideoRef.current.muted = false;
-      remoteVideoRef.current.volume = 1.0;
-      remoteVideoRef.current.play().catch(() => {});
+      remoteAudioRef.current
+        .play()
+        .then(() => {
+          if (remoteAudioStreamRef.current) {
+            soundEngine.attachRemoteWebRtcAudioBackup(remoteAudioStreamRef.current, true);
+          }
+        })
+        .catch(() => {
+          if (remoteAudioStreamRef.current) {
+            soundEngine.attachRemoteWebRtcAudioBackup(remoteAudioStreamRef.current, false);
+          }
+        });
     }
   }, []);
 
@@ -253,118 +276,222 @@ export default function App() {
     async (forceFacingMode?: 'user' | 'environment'): Promise<MediaStream | null> => {
       const targetFacing = forceFacingMode || facingModeRef.current;
 
-      if (localStreamRef.current && !forceFacingMode) {
-        if (localVideoRef.current && localVideoRef.current.srcObject !== localStreamRef.current) {
-          localVideoRef.current.srcObject = localStreamRef.current;
-          localVideoRef.current.play().catch(() => {});
+      const existing = localStreamRef.current;
+      const hasLiveVideo = Boolean(
+        existing &&
+          hasHardwareVideoRef.current &&
+          existing.getVideoTracks().some((t) => t.readyState === 'live')
+      );
+      const hasLiveAudio = Boolean(
+        existing &&
+          hasHardwareAudioRef.current &&
+          existing.getAudioTracks().some((t) => t.readyState === 'live')
+      );
+
+      if (existing && !forceFacingMode) {
+        if (hasLiveVideo && hasLiveAudio) {
+          if (localVideoRef.current && localVideoRef.current.srcObject !== existing) {
+            localVideoRef.current.srcObject = existing;
+            localVideoRef.current.play().catch(() => {});
+          }
+          return existing;
         }
-        return localStreamRef.current;
+        // Throttle hardware re-acquisition attempts to once every 1.8s
+        if (Date.now() - lastMediaRetryAtRef.current < 1800) {
+          return existing;
+        }
       }
+
+      lastMediaRetryAtRef.current = Date.now();
 
       if (typeof navigator !== 'undefined' && navigator.webdriver) {
         return null;
       }
 
+      let acquiredVideoTrack: MediaStreamTrack | null =
+        !forceFacingMode && hasLiveVideo && existing ? existing.getVideoTracks()[0] || null : null;
+      let acquiredAudioTrack: MediaStreamTrack | null =
+        hasLiveAudio && existing ? existing.getAudioTracks()[0] || null : null;
+
       if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-        try {
-          const stream = await navigator.mediaDevices.getUserMedia({
-            video: {
-              facingMode: { ideal: targetFacing },
-              width: { ideal: 640 },
-              height: { ideal: 480 },
-              frameRate: { ideal: 30, max: 30 },
-            },
-            audio: {
-              echoCancellation: true,
-              noiseSuppression: true,
-              autoGainControl: true,
-            },
-          });
-
-          stream.getAudioTracks().forEach((t) => {
-            t.enabled = micEnabledRef.current;
-          });
-          stream.getVideoTracks().forEach((t) => {
-            t.enabled = camEnabledRef.current;
-          });
-
-          if (localStreamRef.current && forceFacingMode) {
-            localStreamRef.current.getTracks().forEach((t) => t.stop());
-          }
-
-          localStreamRef.current = stream;
-          setIsHardwareCam(true);
-          if (localVideoRef.current) {
-            localVideoRef.current.srcObject = stream;
-            localVideoRef.current.play().catch(() => {});
-          }
-          return stream;
-        } catch {
+        // 1. Try combined audio + video with preferred camera facingMode
+        if (!acquiredVideoTrack || !acquiredAudioTrack || forceFacingMode) {
           try {
-            const audioOnlyStream = await navigator.mediaDevices.getUserMedia({
+            const combined = await navigator.mediaDevices.getUserMedia({
+              video: {
+                facingMode: { ideal: targetFacing },
+                width: { ideal: 480 },
+                height: { ideal: 360 },
+              },
               audio: {
                 echoCancellation: true,
                 noiseSuppression: true,
                 autoGainControl: true,
               },
-              video: false,
             });
-            audioOnlyStream.getAudioTracks().forEach((t) => {
-              t.enabled = micEnabledRef.current;
-            });
-            localStreamRef.current = audioOnlyStream;
+            if (combined.getVideoTracks()[0]) {
+              acquiredVideoTrack = combined.getVideoTracks()[0];
+              hasHardwareVideoRef.current = true;
+            }
+            if (combined.getAudioTracks()[0]) {
+              acquiredAudioTrack = combined.getAudioTracks()[0];
+              hasHardwareAudioRef.current = true;
+            }
           } catch {
-            // Ignore
+            // 2. Try unconstrained video + audio (fixes mobile devices that reject width/height constraints)
+            try {
+              const basic = await navigator.mediaDevices.getUserMedia({
+                video: true,
+                audio: true,
+              });
+              if (basic.getVideoTracks()[0]) {
+                acquiredVideoTrack = basic.getVideoTracks()[0];
+                hasHardwareVideoRef.current = true;
+              }
+              if (basic.getAudioTracks()[0]) {
+                acquiredAudioTrack = basic.getAudioTracks()[0];
+                hasHardwareAudioRef.current = true;
+              }
+            } catch {
+              // 3. Try acquiring microphone and camera independently so one never blocks the other
+              if (!acquiredAudioTrack) {
+                try {
+                  const audioOnly = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                      echoCancellation: true,
+                      noiseSuppression: true,
+                      autoGainControl: true,
+                    },
+                    video: false,
+                  });
+                  if (audioOnly.getAudioTracks()[0]) {
+                    acquiredAudioTrack = audioOnly.getAudioTracks()[0];
+                    hasHardwareAudioRef.current = true;
+                  }
+                } catch {
+                  // Ignore
+                }
+              }
+              if (!acquiredVideoTrack || forceFacingMode) {
+                try {
+                  const videoOnly = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: { ideal: targetFacing } },
+                    audio: false,
+                  });
+                  if (videoOnly.getVideoTracks()[0]) {
+                    acquiredVideoTrack = videoOnly.getVideoTracks()[0];
+                    hasHardwareVideoRef.current = true;
+                  }
+                } catch {
+                  // Ignore
+                }
+              }
+            }
           }
         }
       }
 
-      try {
-        const fallbackCanvas = document.createElement('canvas');
-        fallbackCanvas.width = 480;
-        fallbackCanvas.height = 360;
-        const ctx = fallbackCanvas.getContext('2d');
-        const drawFallback = () => {
-          if (!ctx) return;
-          const grad = ctx.createRadialGradient(240, 155, 20, 240, 180, 260);
-          grad.addColorStop(0, '#222834');
-          grad.addColorStop(1, '#101318');
-          ctx.fillStyle = grad;
-          ctx.fillRect(0, 0, 480, 360);
-
-          ctx.fillStyle = '#333b4a';
-          ctx.beginPath();
-          ctx.arc(240, 125, 44, 0, Math.PI * 2);
-          ctx.fill();
-
-          ctx.beginPath();
-          ctx.ellipse(240, 255, 92, 68, 0, Math.PI, 0, false);
-          ctx.fill();
-
-          ctx.strokeStyle = 'rgba(255,255,255,0.12)';
-          ctx.lineWidth = 1.5;
-          ctx.strokeRect(168, 64, 144, 144);
-        };
-        drawFallback();
-        window.setInterval(drawFallback, 250);
-
-        if (typeof fallbackCanvas.captureStream === 'function') {
-          const canvasStream = fallbackCanvas.captureStream(24);
-          if (localStreamRef.current) {
-            const existingAudio = localStreamRef.current.getAudioTracks();
-            existingAudio.forEach((at) => canvasStream.addTrack(at));
-          }
-          localStreamRef.current = canvasStream;
-          if (localVideoRef.current) {
-            localVideoRef.current.srcObject = canvasStream;
-            localVideoRef.current.play().catch(() => {});
-          }
-          return canvasStream;
-        }
-      } catch {
-        // Ignore
+      if (acquiredVideoTrack) {
+        acquiredVideoTrack.enabled = camEnabledRef.current;
+        setIsHardwareCam(true);
       }
-      return localStreamRef.current;
+      if (acquiredAudioTrack) {
+        acquiredAudioTrack.enabled = micEnabledRef.current;
+      }
+
+      // If hardware video was acquired or audio was acquired, build/update the unified MediaStream
+      const finalStream = new MediaStream();
+      if (acquiredAudioTrack) {
+        finalStream.addTrack(acquiredAudioTrack);
+      }
+
+      if (acquiredVideoTrack) {
+        finalStream.addTrack(acquiredVideoTrack);
+      } else {
+        // Fallback synthetic video track if camera hardware is absent or denied
+        try {
+          const fallbackCanvas = document.createElement('canvas');
+          fallbackCanvas.width = 480;
+          fallbackCanvas.height = 360;
+          const ctx = fallbackCanvas.getContext('2d');
+          const drawFallback = () => {
+            if (!ctx) return;
+            const grad = ctx.createRadialGradient(240, 155, 20, 240, 180, 260);
+            grad.addColorStop(0, '#222834');
+            grad.addColorStop(1, '#101318');
+            ctx.fillStyle = grad;
+            ctx.fillRect(0, 0, 480, 360);
+
+            ctx.fillStyle = '#333b4a';
+            ctx.beginPath();
+            ctx.arc(240, 125, 44, 0, Math.PI * 2);
+            ctx.fill();
+
+            ctx.beginPath();
+            ctx.ellipse(240, 255, 92, 68, 0, Math.PI, 0, false);
+            ctx.fill();
+
+            ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+            ctx.lineWidth = 1.5;
+            ctx.strokeRect(168, 64, 144, 144);
+          };
+          drawFallback();
+          window.setInterval(drawFallback, 250);
+
+          if (typeof fallbackCanvas.captureStream === 'function') {
+            const canvasStream = fallbackCanvas.captureStream(20);
+            const fallbackVidTrack = canvasStream.getVideoTracks()[0];
+            if (fallbackVidTrack) {
+              finalStream.addTrack(fallbackVidTrack);
+            }
+          }
+        } catch {
+          // Ignore
+        }
+      }
+
+      // Stop any replaced tracks from the previous stream
+      if (existing && existing !== finalStream) {
+        const newIds = new Set(finalStream.getTracks().map((t) => t.id));
+        existing.getTracks().forEach((t) => {
+          if (!newIds.has(t.id)) {
+            try {
+              t.stop();
+            } catch {
+              // Ignore
+            }
+          }
+        });
+      }
+
+      localStreamRef.current = finalStream;
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = finalStream;
+        localVideoRef.current.muted = true;
+        localVideoRef.current.play().catch(() => {});
+      }
+
+      // If an RTCPeerConnection is already active, make sure newly acquired tracks are attached/replaced
+      const pc = pcRef.current;
+      if (pc && pc.signalingState !== 'closed') {
+        try {
+          const senders = pc.getSenders();
+          for (const track of finalStream.getTracks()) {
+            const matchingSender = senders.find((s) => s.track && s.track.kind === track.kind);
+            if (matchingSender) {
+              if (matchingSender.track?.id !== track.id) {
+                matchingSender.replaceTrack(track).catch(() => {});
+              }
+            } else {
+              pc.addTrack(track, finalStream);
+            }
+          }
+        } catch {
+          // Ignore
+        }
+      }
+
+      return finalStream;
     },
     []
   );
@@ -376,18 +503,7 @@ export default function App() {
     facingModeRef.current = nextFacing;
     soundEngine.playKeyBeep(brandRef.current);
 
-    const newStream = await ensureLocalMedia(nextFacing);
-    if (newStream && pcRef.current) {
-      const newVideoTrack = newStream.getVideoTracks()[0];
-      if (newVideoTrack) {
-        const videoSender = pcRef.current
-          .getSenders()
-          .find((s) => s.track && s.track.kind === 'video');
-        if (videoSender) {
-          videoSender.replaceTrack(newVideoTrack).catch(() => {});
-        }
-      }
-    }
+    await ensureLocalMedia(nextFacing);
   }, [cameraFacingMode, ensureLocalMedia]);
 
   const handleRotateRemoteVideo = useCallback(() => {
@@ -395,7 +511,6 @@ export default function App() {
     setRemoteRotation((prev) => {
       const next = cycleRemoteRotationMode(prev);
       if (next !== 'auto') {
-        // Lock the current stream's portrait/landscape orientation as the baseline for manual rotation
         const remVid = remoteVideoRef.current;
         const remCan = remoteCanvasDisplayRef.current;
         let sw = 0;
@@ -420,7 +535,6 @@ export default function App() {
     });
   }, []);
 
-
   const flushPendingIceCandidates = useCallback(async (pc: RTCPeerConnection) => {
     if (!pc.remoteDescription || !pc.remoteDescription.type) return;
     const queued = pendingIceCandidatesRef.current.splice(0, pendingIceCandidatesRef.current.length);
@@ -435,6 +549,11 @@ export default function App() {
 
   const closePeerConnection = useCallback(() => {
     webrtcConnectedRef.current = false;
+    webrtcAudioRxRef.current = false;
+    webrtcVideoRxRef.current = false;
+    peerWebrtcAudioRxRef.current = false;
+    peerWebrtcVideoRxRef.current = false;
+    pcInitPromiseRef.current = null;
     pendingIceCandidatesRef.current = [];
     if (webrtcOfferRetryTimerRef.current !== null) {
       window.clearTimeout(webrtcOfferRetryTimerRef.current);
@@ -453,6 +572,9 @@ export default function App() {
       pcRef.current = null;
     }
     remoteStreamRef.current = null;
+    remoteVideoStreamRef.current = null;
+    remoteAudioStreamRef.current = null;
+    soundEngine.attachRemoteWebRtcAudioBackup(null, true);
     if (remoteVideoRef.current) {
       remoteVideoRef.current.srcObject = null;
     }
@@ -462,122 +584,167 @@ export default function App() {
   }, []);
 
   const startWebRtcSession = useCallback(
-    async (initiator: boolean) => {
-      // If receiver already created an RTCPeerConnection upon receiving an early webrtc:offer, do NOT destroy it!
+    async (initiator: boolean): Promise<RTCPeerConnection | null> => {
+      // If a peer connection initialization is already in flight or active, reuse it instead of racing!
+      if (pcInitPromiseRef.current) {
+        const existingPc = await pcInitPromiseRef.current;
+        if (existingPc && existingPc.signalingState !== 'closed') {
+          if (initiator && existingPc.signalingState === 'stable' && !existingPc.remoteDescription) {
+            try {
+              const offer = await existingPc.createOffer({
+                offerToReceiveAudio: true,
+                offerToReceiveVideo: true,
+              });
+              await existingPc.setLocalDescription(offer);
+              sendWs({
+                type: 'webrtc:offer',
+                sdp: existingPc.localDescription,
+              });
+            } catch {
+              // Ignore
+            }
+          }
+          return existingPc;
+        }
+      }
+
       if (!initiator && pcRef.current && pcRef.current.signalingState !== 'closed') {
         return pcRef.current;
       }
 
       closePeerConnection();
 
-      try {
-        const pc = new RTCPeerConnection(RTC_CONFIG);
-        pcRef.current = pc;
+      const initTask = (async (): Promise<RTCPeerConnection | null> => {
+        try {
+          // Acquire local camera/microphone FIRST so tracks are always attached before createOffer/createAnswer!
+          const stream = await ensureLocalMedia();
 
-        const combinedRemote = new MediaStream();
-        remoteStreamRef.current = combinedRemote;
+          const pc = new RTCPeerConnection(RTC_CONFIG);
+          pcRef.current = pc;
 
-        const updateConnectedState = () => {
-          if (pcRef.current !== pc) return;
-          const isConn =
-            pc.connectionState === 'connected' ||
-            pc.iceConnectionState === 'connected' ||
-            pc.iceConnectionState === 'completed';
-          webrtcConnectedRef.current = isConn;
-          if (isConn) {
-            unlockRemoteAudioElements();
-          }
-        };
+          const combinedRemote = new MediaStream();
+          remoteStreamRef.current = combinedRemote;
 
-        pc.onconnectionstatechange = updateConnectedState;
-        pc.oniceconnectionstatechange = updateConnectedState;
+          const updateConnectedState = () => {
+            if (pcRef.current !== pc) return;
+            const isConn =
+              pc.connectionState === 'connected' ||
+              pc.iceConnectionState === 'connected' ||
+              pc.iceConnectionState === 'completed';
+            webrtcConnectedRef.current = isConn;
+            if (isConn) {
+              unlockRemoteAudioElements();
+            }
+          };
 
-        pc.onicecandidate = (event) => {
-          if (event.candidate && pcRef.current === pc) {
-            sendWs({
-              type: 'webrtc:ice',
-              candidate: event.candidate,
+          pc.onconnectionstatechange = updateConnectedState;
+          pc.oniceconnectionstatechange = updateConnectedState;
+
+          pc.onicecandidate = (event) => {
+            if (event.candidate && pcRef.current === pc) {
+              sendWs({
+                type: 'webrtc:ice',
+                candidate: event.candidate,
+              });
+            }
+          };
+
+          pc.ontrack = (event) => {
+            if (!event.track) return;
+            if (remoteStreamRef.current) {
+              remoteStreamRef.current.addTrack(event.track);
+            }
+
+            if (event.track.kind === 'video') {
+              const vidStream = new MediaStream([event.track]);
+              remoteVideoStreamRef.current = vidStream;
+              if (remoteVideoRef.current) {
+                remoteVideoRef.current.srcObject = vidStream;
+                // Keep remoteVideoRef strictly muted so mobile browsers never block video decoding!
+                remoteVideoRef.current.muted = true;
+                remoteVideoRef.current.play().catch(() => {});
+              }
+            } else if (event.track.kind === 'audio') {
+              const audStream = new MediaStream([event.track]);
+              remoteAudioStreamRef.current = audStream;
+              if (remoteAudioRef.current) {
+                remoteAudioRef.current.srcObject = audStream;
+                remoteAudioRef.current.muted = false;
+                remoteAudioRef.current.volume = 1.0;
+                remoteAudioRef.current
+                  .play()
+                  .then(() => {
+                    soundEngine.attachRemoteWebRtcAudioBackup(audStream, true);
+                  })
+                  .catch(() => {
+                    soundEngine.attachRemoteWebRtcAudioBackup(audStream, false);
+                  });
+              } else {
+                soundEngine.attachRemoteWebRtcAudioBackup(audStream, false);
+              }
+            }
+          };
+
+          if (stream && pc.signalingState !== 'closed') {
+            const existingTrackIds = new Set(
+              pc
+                .getSenders()
+                .map((s) => s.track?.id)
+                .filter(Boolean)
+            );
+            stream.getTracks().forEach((track) => {
+              if (!existingTrackIds.has(track.id)) {
+                pc.addTrack(track, stream);
+              }
             });
           }
-        };
 
-        pc.ontrack = (event) => {
-          if (event.track && remoteStreamRef.current) {
-            remoteStreamRef.current.addTrack(event.track);
+          if (initiator && pc.signalingState === 'stable') {
+            const offer = await pc.createOffer({
+              offerToReceiveAudio: true,
+              offerToReceiveVideo: true,
+            });
+            await pc.setLocalDescription(offer);
+            sendWs({
+              type: 'webrtc:offer',
+              sdp: pc.localDescription,
+            });
+
+            // ONLY retry sending webrtc:offer if we are STILL waiting in 'have-local-offer' (no answer received yet!)
+            webrtcOfferRetryTimerRef.current = window.setTimeout(() => {
+              if (
+                pcRef.current === pc &&
+                pc.signalingState === 'have-local-offer' &&
+                pc.localDescription
+              ) {
+                sendWs({
+                  type: 'webrtc:offer',
+                  sdp: pc.localDescription,
+                });
+                webrtcOfferRetryTimerRef.current = window.setTimeout(() => {
+                  if (
+                    pcRef.current === pc &&
+                    pc.signalingState === 'have-local-offer' &&
+                    pc.localDescription
+                  ) {
+                    sendWs({
+                      type: 'webrtc:offer',
+                      sdp: pc.localDescription,
+                    });
+                  }
+                }, 1700);
+              }
+            }, 1100);
           }
-          const targetStream =
-            event.streams && event.streams[0] ? event.streams[0] : remoteStreamRef.current;
 
-          if (targetStream) {
-            if (remoteVideoRef.current) {
-              remoteVideoRef.current.srcObject = targetStream;
-              remoteVideoRef.current.muted = false;
-              remoteVideoRef.current.volume = 1.0;
-              remoteVideoRef.current.play().catch(() => {});
-            }
-            if (remoteAudioRef.current) {
-              remoteAudioRef.current.srcObject = targetStream;
-              remoteAudioRef.current.muted = false;
-              remoteAudioRef.current.volume = 1.0;
-              remoteAudioRef.current.play().catch(() => {});
-            }
-          }
-        };
-
-        const stream = await ensureLocalMedia();
-        if (pcRef.current !== pc || pc.signalingState === 'closed') {
-          return pcRef.current;
+          return pc;
+        } catch {
+          return null;
         }
+      })();
 
-        if (stream) {
-          const existingTrackIds = new Set(
-            pc
-              .getSenders()
-              .map((s) => s.track?.id)
-              .filter(Boolean)
-          );
-          stream.getTracks().forEach((track) => {
-            if (!existingTrackIds.has(track.id)) {
-              pc.addTrack(track, stream);
-            }
-          });
-        }
-
-        if (initiator && pc.signalingState === 'stable') {
-          const offer = await pc.createOffer({
-            offerToReceiveAudio: true,
-            offerToReceiveVideo: true,
-          });
-          await pc.setLocalDescription(offer);
-          sendWs({
-            type: 'webrtc:offer',
-            sdp: pc.localDescription,
-          });
-
-          // Re-send bundled SDP offer (with gathered STUN/TURN candidates) after 950ms and 2600ms if not yet connected
-          webrtcOfferRetryTimerRef.current = window.setTimeout(() => {
-            if (pcRef.current === pc && !webrtcConnectedRef.current && pc.localDescription) {
-              sendWs({
-                type: 'webrtc:offer',
-                sdp: pc.localDescription,
-              });
-              webrtcOfferRetryTimerRef.current = window.setTimeout(() => {
-                if (pcRef.current === pc && !webrtcConnectedRef.current && pc.localDescription) {
-                  sendWs({
-                    type: 'webrtc:offer',
-                    sdp: pc.localDescription,
-                  });
-                }
-              }, 1650);
-            }
-          }, 950);
-        }
-
-        return pc;
-      } catch {
-        // Frame relay fallback handles video even if RTCPeerConnection fails
-        return null;
-      }
+      pcInitPromiseRef.current = initTask;
+      return initTask;
     },
     [closePeerConnection, ensureLocalMedia, sendWs, unlockRemoteAudioElements]
   );
@@ -593,17 +760,68 @@ export default function App() {
       captureCanvasRef.current = c;
     }
 
+    let lastAudioBytesRx = 0;
+    let lastVideoBytesRx = 0;
+
+    // Poll actual WebRTC RTP bytesReceived every 1s so we know with 100% certainty whether WebRTC media is flowing
+    const statsTimer = window.setInterval(async () => {
+      const pc = pcRef.current;
+      if (!pc || pc.signalingState === 'closed') {
+        webrtcAudioRxRef.current = false;
+        webrtcVideoRxRef.current = false;
+        return;
+      }
+      try {
+        const stats = await pc.getStats();
+        let curAudioBytes = 0;
+        let curVideoBytes = 0;
+        stats.forEach((report) => {
+          if (report.type === 'inbound-rtp') {
+            const kind = report.kind || report.mediaType;
+            if (kind === 'audio') {
+              curAudioBytes += Number(report.bytesReceived) || 0;
+            } else if (kind === 'video') {
+              curVideoBytes += Number(report.bytesReceived) || 0;
+            }
+          }
+        });
+        const audioFlowing = curAudioBytes - lastAudioBytesRx > 400;
+        const videoFlowing =
+          curVideoBytes - lastVideoBytesRx > 1500 &&
+          Boolean(remoteVideoRef.current && remoteVideoRef.current.videoWidth > 0);
+        lastAudioBytesRx = curAudioBytes;
+        lastVideoBytesRx = curVideoBytes;
+
+        const changed =
+          webrtcAudioRxRef.current !== audioFlowing || webrtcVideoRxRef.current !== videoFlowing;
+        webrtcAudioRxRef.current = audioFlowing;
+        webrtcVideoRxRef.current = videoFlowing;
+
+        if (changed) {
+          sendWs({
+            type: 'media:state',
+            micEnabled: micEnabledRef.current,
+            camEnabled: camEnabledRef.current,
+            webrtcAudioRx: audioFlowing,
+            webrtcVideoRx: videoFlowing,
+          });
+        }
+      } catch {
+        // Ignore stats error
+      }
+    }, 1000);
+
     const sendFrameNow = () => {
       const remVideo = remoteVideoRef.current;
       const remCanvas = remoteCanvasDisplayRef.current;
-      const hasLiveWebRtcVideo = Boolean(
-        webrtcConnectedRef.current &&
-          remVideo &&
-          remVideo.readyState >= 2 &&
-          remVideo.videoWidth > 0
-      );
 
-      if (remVideo && remVideo.readyState >= 2 && remVideo.videoWidth > 0 && remCanvas) {
+      if (
+        webrtcVideoRxRef.current &&
+        remVideo &&
+        remVideo.readyState >= 2 &&
+        remVideo.videoWidth > 0 &&
+        remCanvas
+      ) {
         if (
           remCanvas.width !== remVideo.videoWidth ||
           remCanvas.height !== remVideo.videoHeight
@@ -620,11 +838,13 @@ export default function App() {
 
       const isServerless = wsRef.current?.mode === 'serverless';
       const now = Date.now();
-      if (isServerless) {
-        const minInterval = hasLiveWebRtcVideo ? 2500 : 230;
-        if (now - lastFallbackFrameSentAt < minInterval) {
-          return;
-        }
+      const minInterval = peerWebrtcVideoRxRef.current
+        ? 2500
+        : isServerless
+          ? 165
+          : 110;
+      if (now - lastFallbackFrameSentAt < minInterval) {
+        return;
       }
       lastFallbackFrameSentAt = now;
 
@@ -633,37 +853,37 @@ export default function App() {
       const ctx = capCanvas.getContext('2d');
       if (!ctx) return;
 
-      const maxDim = isServerless ? 240 : 480;
+      const maxDim = isServerless ? 200 : 380;
       const videoEl = localVideoRef.current;
-      if (camEnabledRef.current && videoEl && videoEl.readyState >= 2) {
+      if (camEnabledRef.current && videoEl && videoEl.readyState >= 2 && videoEl.videoWidth > 0) {
         const vw = videoEl.videoWidth || 480;
         const vh = videoEl.videoHeight || 360;
         const scale = Math.min(1, maxDim / Math.max(vw, vh));
-        const targetW = Math.max(130, Math.round(vw * scale));
-        const targetH = Math.max(98, Math.round(vh * scale));
+        const targetW = Math.max(120, Math.round(vw * scale));
+        const targetH = Math.max(90, Math.round(vh * scale));
         if (capCanvas.width !== targetW || capCanvas.height !== targetH) {
           capCanvas.width = targetW;
           capCanvas.height = targetH;
         }
         ctx.imageSmoothingEnabled = true;
-        ctx.imageSmoothingQuality = 'high';
+        ctx.imageSmoothingQuality = 'medium';
         ctx.drawImage(videoEl, 0, 0, targetW, targetH);
       } else {
-        capCanvas.width = 320;
-        capCanvas.height = 240;
+        capCanvas.width = 240;
+        capCanvas.height = 180;
         ctx.fillStyle = '#101216';
-        ctx.fillRect(0, 0, 320, 240);
+        ctx.fillRect(0, 0, 240, 180);
         ctx.fillStyle = '#d5d8de';
-        ctx.font = '700 20px "JetBrains Mono", monospace';
+        ctx.font = '700 18px "JetBrains Mono", monospace';
         ctx.textAlign = 'center';
-        ctx.fillText(`PIN #${myPinRef.current || '---'}`, 160, 110);
+        ctx.fillText(`PIN #${myPinRef.current || '---'}`, 120, 84);
         ctx.fillStyle = '#7c828d';
-        ctx.font = '600 13px "JetBrains Mono", monospace';
-        ctx.fillText(camEnabledRef.current ? 'AUDIO ACTIVE' : 'CAMERA OFF', 160, 140);
+        ctx.font = '600 12px "JetBrains Mono", monospace';
+        ctx.fillText(camEnabledRef.current ? 'AUDIO ACTIVE' : 'CAMERA OFF', 120, 112);
       }
 
       try {
-        const dataUrl = capCanvas.toDataURL('image/jpeg', isServerless ? 0.5 : 0.72);
+        const dataUrl = capCanvas.toDataURL('image/jpeg', isServerless ? 0.48 : 0.68);
         sendWs({
           type: 'media:frame',
           frame: dataUrl,
@@ -684,11 +904,13 @@ export default function App() {
     });
 
     sendFrameNow();
-    const timer = window.setInterval(sendFrameNow, 95);
+    const timer = window.setInterval(sendFrameNow, 85);
 
     let audioCtx: AudioContext | null = null;
-    let processor: ScriptProcessorNode | null = null;
+    let workletNode: AudioWorkletNode | null = null;
     let sourceNode: MediaStreamAudioSourceNode | null = null;
+    let silentGain: GainNode | null = null;
+    let workletUrl: string | null = null;
     let cancelled = false;
 
     const setupFallbackAudioCapture = async () => {
@@ -706,47 +928,75 @@ export default function App() {
           (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
         if (!AudioCtx) return;
 
-        // Use native hardware sample rate so mobile Safari / Android Chrome never throw NotSupportedError
         audioCtx = new AudioCtx();
         if (audioCtx.state === 'suspended') {
           audioCtx.resume().catch(() => {});
         }
         const inRate = audioCtx.sampleRate || 48000;
-        const targetRate = 12000;
+        const targetRate = 8000;
         const step = Math.max(1, inRate / targetRate);
+        const outRate = Math.round(inRate / step);
 
         sourceNode = audioCtx.createMediaStreamSource(new MediaStream([audioTracks[0]]));
-        processor = audioCtx.createScriptProcessor(4096, 1, 1);
-        processor.onaudioprocess = (e) => {
-          if (!micEnabledRef.current) return;
-          const hasLiveWebRtcAudio = Boolean(
-            webrtcConnectedRef.current &&
-              remoteStreamRef.current &&
-              remoteStreamRef.current.getAudioTracks().some((t) => t.readyState === 'live')
-          );
-          if (hasLiveWebRtcAudio) return;
+        silentGain = audioCtx.createGain();
+        silentGain.gain.value = 0;
+        silentGain.connect(audioCtx.destination);
 
-          const input = e.inputBuffer.getChannelData(0);
-          let sum = 0;
-          for (let i = 0; i < input.length; i += 4) {
-            sum += Math.abs(input[i]);
-          }
-          if (sum / (input.length / 4) < 0.003) return;
+        let accum: number[] = [];
+        const CHUNK_SAMPLES = 1280; // 160ms at 8000Hz -> ~1.7 KB Base64 PCM8 packet
 
-          const outLen = Math.floor(input.length / step);
-          const quantized = new Array(outLen);
-          for (let i = 0; i < outLen; i++) {
-            const sample = input[Math.min(input.length - 1, Math.floor(i * step))];
-            quantized[i] = Math.round(sample * 1000) / 1000;
+        const pushInputSamples = (input: Float32Array) => {
+          if (!micEnabledRef.current || peerWebrtcAudioRxRef.current) {
+            accum = [];
+            return;
           }
-          sendWs({
-            type: 'media:audio',
-            samples: quantized,
-            rate: Math.round(inRate / step),
-          });
+          for (let i = 0; i < input.length; i += step) {
+            const idx = Math.min(input.length - 1, Math.floor(i));
+            accum.push(input[idx]);
+          }
+          while (accum.length >= CHUNK_SAMPLES) {
+            const slice = accum.splice(0, CHUNK_SAMPLES);
+            let peak = 0;
+            for (let j = 0; j < slice.length; j += 4) {
+              const a = Math.abs(slice[j]);
+              if (a > peak) peak = a;
+            }
+            if (peak >= 0.004) {
+              sendWs({
+                type: 'media:audio',
+                pcm8: encodePcm8Base64(slice),
+                rate: outRate,
+              });
+            }
+          }
         };
-        sourceNode.connect(processor);
-        processor.connect(audioCtx.destination);
+
+        if (audioCtx.audioWorklet && typeof AudioWorkletNode !== 'undefined') {
+          const workletCode = `
+            class IntercomMicProcessor extends AudioWorkletProcessor {
+              process(inputs) {
+                const input = inputs[0];
+                if (input && input[0] && input[0].length > 0) {
+                  this.port.postMessage(input[0]);
+                }
+                return true;
+              }
+            }
+            registerProcessor('intercom-mic-processor', IntercomMicProcessor);
+          `;
+          const blob = new Blob([workletCode], { type: 'application/javascript' });
+          workletUrl = URL.createObjectURL(blob);
+          await audioCtx.audioWorklet.addModule(workletUrl);
+          if (cancelled) return;
+          workletNode = new AudioWorkletNode(audioCtx, 'intercom-mic-processor');
+          workletNode.port.onmessage = (ev) => {
+            if (ev.data instanceof Float32Array) {
+              pushInputSamples(ev.data);
+            }
+          };
+          sourceNode.connect(workletNode);
+          workletNode.connect(silentGain);
+        }
       } catch {
         // Ignore fallback audio errors
       }
@@ -757,10 +1007,15 @@ export default function App() {
     return () => {
       cancelled = true;
       window.clearInterval(timer);
+      window.clearInterval(statsTimer);
       try {
-        processor?.disconnect();
+        workletNode?.disconnect();
         sourceNode?.disconnect();
+        silentGain?.disconnect();
         audioCtx?.close();
+        if (workletUrl) {
+          URL.revokeObjectURL(workletUrl);
+        }
       } catch {
         // Ignore
       }
@@ -969,14 +1224,11 @@ export default function App() {
           }
 
           case 'call:peer_paused': {
-            // Partner temporarily closed browser, locked phone, or refreshed page:
-            // Keep the call active and keep their last video frame frozen on screen!
             closePeerConnection();
             break;
           }
 
           case 'call:peer_resumed': {
-            // Partner returned to the call! Re-establish WebRTC session and resume streaming without resetting chat or screen
             const peer = String(msg.peerPin || '');
             if (peer) setPeerPin(peer);
             setCallState('connected');
@@ -1013,6 +1265,10 @@ export default function App() {
             setPeerPin(matchedPin);
             setAutoDialBuffer('');
             setCallState('autodialing');
+
+            // Start WebRTC negotiation in the background immediately while the keypad digits animate!
+            unlockRemoteAudioElements();
+            startWebRtcSession(initiator);
 
             const digits = matchedPin.split('');
             digits.forEach((digit, idx) => {
@@ -1095,10 +1351,24 @@ export default function App() {
           case 'webrtc:offer': {
             try {
               let pc = pcRef.current;
-              if (!pc || pc.signalingState === 'closed') {
+              if (!pc || pc.signalingState === 'closed' || pcInitPromiseRef.current) {
                 pc = await startWebRtcSession(false);
               }
               if (pc && msg.sdp) {
+                // If we already accepted this exact SDP offer and are in 'stable' state, just re-send our existing answer!
+                if (
+                  pc.signalingState === 'stable' &&
+                  pc.remoteDescription &&
+                  pc.remoteDescription.sdp === msg.sdp.sdp &&
+                  pc.localDescription
+                ) {
+                  sendWs({
+                    type: 'webrtc:answer',
+                    sdp: pc.localDescription,
+                  });
+                  break;
+                }
+
                 if (pc.signalingState === 'have-local-offer') {
                   await pc.setLocalDescription({ type: 'rollback' } as RTCSessionDescriptionInit);
                 }
@@ -1110,15 +1380,6 @@ export default function App() {
                   type: 'webrtc:answer',
                   sdp: pc.localDescription,
                 });
-                // Also re-send bundled answer with gathered STUN/TURN candidates after 800ms
-                window.setTimeout(() => {
-                  if (pcRef.current === pc && !webrtcConnectedRef.current && pc.localDescription) {
-                    sendWs({
-                      type: 'webrtc:answer',
-                      sdp: pc.localDescription,
-                    });
-                  }
-                }, 800);
               }
             } catch {
               // Ignore
@@ -1128,6 +1389,10 @@ export default function App() {
 
           case 'webrtc:answer': {
             try {
+              if (webrtcOfferRetryTimerRef.current !== null) {
+                window.clearTimeout(webrtcOfferRetryTimerRef.current);
+                webrtcOfferRetryTimerRef.current = null;
+              }
               const pc = pcRef.current;
               if (pc && msg.sdp) {
                 if (
@@ -1166,6 +1431,12 @@ export default function App() {
             if (typeof msg.camEnabled === 'boolean') {
               setPeerCamEnabled(msg.camEnabled);
             }
+            if (typeof msg.webrtcAudioRx === 'boolean') {
+              peerWebrtcAudioRxRef.current = msg.webrtcAudioRx;
+            }
+            if (typeof msg.webrtcVideoRx === 'boolean') {
+              peerWebrtcVideoRxRef.current = msg.webrtcVideoRx;
+            }
             break;
           }
 
@@ -1176,20 +1447,19 @@ export default function App() {
             if (typeof msg.camEnabled === 'boolean') {
               setPeerCamEnabled(msg.camEnabled);
             }
-            if (typeof msg.frame === 'string') {
+            if (typeof msg.frame === 'string' && !webrtcVideoRxRef.current) {
               drawFrameToRemoteCanvas(msg.frame);
             }
             break;
           }
 
           case 'media:audio': {
-            const hasLiveWebRtcAudio = Boolean(
-              webrtcConnectedRef.current &&
-                remoteStreamRef.current &&
-                remoteStreamRef.current.getAudioTracks().some((t) => t.readyState === 'live')
-            );
-            if (!hasLiveWebRtcAudio && Array.isArray(msg.samples)) {
-              soundEngine.playPcmFloat32Chunk(msg.samples, Number(msg.rate) || 12000);
+            if (!webrtcAudioRxRef.current) {
+              if (typeof msg.pcm8 === 'string' && msg.pcm8) {
+                soundEngine.playPcm8Base64Chunk(msg.pcm8, Number(msg.rate) || 8000);
+              } else if (Array.isArray(msg.samples)) {
+                soundEngine.playPcmFloat32Chunk(msg.samples, Number(msg.rate) || 12000);
+              }
             }
             break;
           }
@@ -1254,7 +1524,6 @@ export default function App() {
         connect();
         return;
       }
-      // If socket claims to be open but we haven't received any server traffic for >32s, force a fresh connection
       if (Date.now() - lastServerTrafficAt > 32000) {
         try {
           ws.close();
@@ -1273,7 +1542,6 @@ export default function App() {
       }
     };
 
-    // Unthrottled Web Worker timer so background tabs continue sending keepalive pings
     let heartbeatWorker: Worker | null = null;
     let workerUrl: string | null = null;
     try {
@@ -1366,17 +1634,19 @@ export default function App() {
 
   const handleStartRoulette = useCallback(() => {
     unlockRemoteAudioElements();
+    ensureLocalMedia();
     setMode('roulette');
     modeRef.current = 'roulette';
     setCurrentInput('');
     sendWs({ type: 'roulette:start' });
-  }, [sendWs, unlockRemoteAudioElements]);
+  }, [ensureLocalMedia, sendWs, unlockRemoteAudioElements]);
 
   const handleNextRoulette = useCallback(() => {
     unlockRemoteAudioElements();
+    ensureLocalMedia();
     soundEngine.playKeyBeep(brand);
     sendWs({ type: 'roulette:next' });
-  }, [brand, sendWs, unlockRemoteAudioElements]);
+  }, [brand, ensureLocalMedia, sendWs, unlockRemoteAudioElements]);
 
   const handleStopRoulette = useCallback(() => {
     soundEngine.playKeyBeep(brand);
@@ -1391,9 +1661,10 @@ export default function App() {
 
   const handleAnswerCall = useCallback(() => {
     unlockRemoteAudioElements();
+    ensureLocalMedia();
     soundEngine.playKeyBeep(brand);
     sendWs({ type: 'call:answer' });
-  }, [brand, sendWs, unlockRemoteAudioElements]);
+  }, [brand, ensureLocalMedia, sendWs, unlockRemoteAudioElements]);
 
   const handleHangupCall = useCallback(() => {
     soundEngine.playKeyBeep(brand);
@@ -1473,6 +1744,7 @@ export default function App() {
 
         case 'DIAL_CODE':
           soundEngine.playKeyBeep(brand);
+          ensureLocalMedia();
           sendWs({ type: 'call:dial', targetPin: action.targetPin });
           break;
 
@@ -1507,6 +1779,7 @@ export default function App() {
       brand,
       callState,
       currentInput,
+      ensureLocalMedia,
       handleAnswerCall,
       handleHangupCall,
       handleNextRoulette,
@@ -1570,6 +1843,8 @@ export default function App() {
         type: 'media:state',
         micEnabled: next,
         camEnabled: camEnabledRef.current,
+        webrtcAudioRx: webrtcAudioRxRef.current,
+        webrtcVideoRx: webrtcVideoRxRef.current,
       });
       return next;
     });
@@ -1589,6 +1864,8 @@ export default function App() {
         type: 'media:state',
         micEnabled: micEnabledRef.current,
         camEnabled: next,
+        webrtcAudioRx: webrtcAudioRxRef.current,
+        webrtcVideoRx: webrtcVideoRxRef.current,
       });
       return next;
     });
@@ -1632,10 +1909,13 @@ export default function App() {
       data-call-state={callState}
       data-mode={mode}
     >
-      {/* Hidden offscreen media elements feeding the 3D Intercom screen, Audio output & Fullscreen Monitor */}
-      <div className="sr-only pointer-events-none" aria-hidden="true">
-        <video ref={localVideoRef} autoPlay muted playsInline />
-        <video ref={remoteVideoRef} autoPlay playsInline />
+      {/* Offscreen media elements with real dimensions so mobile hardware video decoders never pause */}
+      <div
+        className="fixed -left-[9999px] top-0 w-40 h-30 opacity-0 pointer-events-none overflow-hidden"
+        aria-hidden="true"
+      >
+        <video ref={localVideoRef} autoPlay muted playsInline width={160} height={120} />
+        <video ref={remoteVideoRef} autoPlay muted playsInline width={160} height={120} />
         <audio ref={remoteAudioRef} autoPlay playsInline />
         <canvas ref={remoteCanvasDisplayRef} width={480} height={360} />
       </div>

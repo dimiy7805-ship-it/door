@@ -8,14 +8,48 @@ export interface ToneStep {
   gain?: number;
 }
 
+export function encodePcm8Base64(samples: Float32Array | number[]): string {
+  const len = samples.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    const clamped = Math.max(-1, Math.min(1, samples[i]));
+    // Slight non-linear companding (sign * sqrt(|x|)) for much clearer voice intelligibility at 8-bit
+    const companded = Math.sign(clamped) * Math.sqrt(Math.abs(clamped));
+    bytes[i] = Math.max(0, Math.min(255, Math.round((companded + 1) * 127.5)));
+  }
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < len; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+export function decodePcm8Base64(b64: string): Float32Array {
+  const binary = atob(b64);
+  const len = binary.length;
+  const out = new Float32Array(len);
+  for (let i = 0; i < len; i++) {
+    const companded = binary.charCodeAt(i) / 127.5 - 1;
+    out[i] = Math.sign(companded) * companded * companded;
+  }
+  return out;
+}
+
 class IntercomSoundEngine {
   private ctx: AudioContext | null = null;
   private ringTimer: number | null = null;
   private muted = false;
   private nextPcmPlayTime = 0;
+  private remoteStreamSource: MediaStreamAudioSourceNode | null = null;
+  private remoteStreamGain: GainNode | null = null;
 
   public setVoiceCallActive(_active: boolean) {
     // All sounds share the unified Web Audio context stream with call/ring audio
+  }
+
+  public unlock(): AudioContext | null {
+    return this.getContext();
   }
 
   private getContext(): AudioContext | null {
@@ -32,6 +66,31 @@ class IntercomSoundEngine {
       this.ctx.resume().catch(() => {});
     }
     return this.ctx;
+  }
+
+  public attachRemoteWebRtcAudioBackup(stream: MediaStream | null, htmlAudioPlaying: boolean) {
+    const ctx = this.getContext();
+    if (!ctx) return;
+    try {
+      if (this.remoteStreamSource) {
+        this.remoteStreamSource.disconnect();
+        this.remoteStreamSource = null;
+      }
+      if (this.remoteStreamGain) {
+        this.remoteStreamGain.disconnect();
+        this.remoteStreamGain = null;
+      }
+      if (!stream || stream.getAudioTracks().length === 0) return;
+
+      this.remoteStreamSource = ctx.createMediaStreamSource(stream);
+      this.remoteStreamGain = ctx.createGain();
+      // Only amplify via WebAudio if HTMLAudioElement is blocked/paused by mobile browser policy
+      this.remoteStreamGain.gain.value = htmlAudioPlaying ? 0.0 : 1.35;
+      this.remoteStreamSource.connect(this.remoteStreamGain);
+      this.remoteStreamGain.connect(ctx.destination);
+    } catch {
+      // Ignore if stream has no active audio tracks
+    }
   }
 
   public setMuted(mute: boolean) {
@@ -122,32 +181,60 @@ class IntercomSoundEngine {
   }
 
   /**
+   * Plays incoming companded 8-bit PCM Base64 voice audio chunks smoothly with jitter buffering.
+   */
+  public playPcm8Base64Chunk(b64: string, sampleRate = 8000) {
+    if (this.muted || !b64) return;
+    try {
+      const floatSamples = decodePcm8Base64(b64);
+      this.scheduleFloat32Samples(floatSamples, sampleRate);
+    } catch {
+      // Ignore malformed chunk
+    }
+  }
+
+  /**
    * Plays incoming fallback PCM float32 voice audio chunks when direct WebRTC media is unavailable.
    */
-  public playPcmFloat32Chunk(samples: number[], sampleRate = 16000) {
+  public playPcmFloat32Chunk(samples: number[] | Float32Array, sampleRate = 12000) {
     if (this.muted || !samples || samples.length === 0) return;
+    const arr = samples instanceof Float32Array ? samples : new Float32Array(samples);
+    this.scheduleFloat32Samples(arr, sampleRate);
+  }
+
+  private scheduleFloat32Samples(samples: Float32Array, sampleRate: number) {
     const ctx = this.getContext();
-    if (!ctx) return;
+    if (!ctx || samples.length === 0) return;
 
     try {
-      const buffer = ctx.createBuffer(1, samples.length, sampleRate);
+      const safeRate = Math.max(4000, Math.min(48000, sampleRate || 8000));
+      const buffer = ctx.createBuffer(1, samples.length, safeRate);
       const channel = buffer.getChannelData(0);
+      // Apply 4ms micro-fade at chunk edges to eliminate any click/pop if network packets jitter
+      const fadeLen = Math.min(32, Math.floor(samples.length / 8));
       for (let i = 0; i < samples.length; i++) {
-        channel[i] = samples[i];
+        let env = 1.0;
+        if (i < fadeLen) {
+          env = i / fadeLen;
+        } else if (i >= samples.length - fadeLen) {
+          env = (samples.length - 1 - i) / fadeLen;
+        }
+        channel[i] = samples[i] * env;
       }
 
       const source = ctx.createBufferSource();
       source.buffer = buffer;
 
       const gainNode = ctx.createGain();
-      gainNode.gain.value = 1.25;
+      gainNode.gain.value = 1.55;
 
       source.connect(gainNode);
       gainNode.connect(ctx.destination);
 
       const now = ctx.currentTime;
-      if (this.nextPcmPlayTime < now || this.nextPcmPlayTime > now + 0.6) {
-        this.nextPcmPlayTime = now + 0.02;
+      if (this.nextPcmPlayTime < now || this.nextPcmPlayTime > now + 0.85) {
+        // 75ms jitter buffer so consecutive network chunks play back-to-back seamlessly
+        this.nextPcmPlayTime = now + 0.075;
       }
       source.start(this.nextPcmPlayTime);
       this.nextPcmPlayTime += buffer.duration;

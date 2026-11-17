@@ -20,16 +20,25 @@ const WS_OPEN = 1;
 const WS_CLOSED = 3;
 
 const MESH_TOPIC = 'domofon-liniya-v1/room/v1';
-const NTFY_SIGNAL_TOPIC = 'domofon_liniya_v1_sig_2026';
+function getDirectTopic(clientId: string): string {
+  return `domofon-liniya-v1/direct/${clientId}`;
+}
+
 interface MqttBrokerConfig {
   url: string;
   username?: string;
   password?: string;
+  isPort443?: boolean;
 }
 
 const PUBLIC_MQTT_BROKERS: MqttBrokerConfig[] = [
   // Primary Port-443 broker: bypasses mobile carrier (MTS/MegaFon/Beeline/Tele2) non-443 port blocks
-  { url: 'wss://public.cloud.shiftr.io:443/mqtt', username: 'public', password: 'public' },
+  {
+    url: 'wss://public.cloud.shiftr.io:443/mqtt',
+    username: 'public',
+    password: 'public',
+    isPort443: true,
+  },
   { url: 'wss://broker.emqx.io:8084/mqtt' },
   { url: 'wss://broker.hivemq.com:8884/mqtt' },
   { url: 'wss://test.mosquitto.org:8081/mqtt' },
@@ -62,7 +71,11 @@ function encodeMqttString(str: string): number[] {
   return [(bytes.length >> 8) & 0xff, bytes.length & 0xff, ...bytes];
 }
 
-function buildMqttConnectPacket(clientId: string, username?: string, password?: string): Uint8Array {
+function buildMqttConnectPacket(
+  clientId: string,
+  username?: string,
+  password?: string
+): Uint8Array {
   const hasAuth = Boolean(username && password);
   const varHeader = [
     0x00,
@@ -165,11 +178,13 @@ interface MeshPeerState {
   rouletteJoinedAt: number;
   callId: string | null;
   lastSeen: number;
+  lastBrokerUrl?: string;
 }
 
 /**
  * Serverless P2P / Multi-Broker + Port-443 Mesh Coordinator so the entire 3D Intercom works on
- * static hosts like GitHub Pages (*.github.io) across both Wi-Fi and Mobile Data (4G/LTE/5G).
+ * static hosts like GitHub Pages (*.github.io) across both Wi-Fi and Mobile Data (4G/LTE/5G)
+ * without any HTTP 429 rate-limit errors or self-echo congestion.
  */
 class ServerlessMeshTransport implements IntercomTransport {
   public onopen: (() => void) | null = null;
@@ -191,14 +206,12 @@ class ServerlessMeshTransport implements IntercomTransport {
 
   private peers = new Map<string, MeshPeerState>();
   private mqttSockets = new Map<string, WebSocket>();
-  private ntfyWs: WebSocket | null = null;
+  private mqttSubscribedDirect = new Set<string>();
   private bc: BroadcastChannel | null = null;
   private heartbeatTimer: number | null = null;
   private pingTimer: number | null = null;
   private seenPacketIds = new Set<string>();
   private pktSeq = 0;
-  private lastNtfyPostAt = 0;
-  private lastNtfyPresencePostAt = 0;
   private lastFrameRelayAt = 0;
   private lastAudioRelayAt = 0;
   private closed = false;
@@ -217,7 +230,7 @@ class ServerlessMeshTransport implements IntercomTransport {
 
     this.pingTimer = window.setInterval(() => {
       this.sendMqttPingAll();
-    }, 22000);
+    }, 20000);
 
     window.setTimeout(() => {
       if (!this.closed) {
@@ -248,20 +261,38 @@ class ServerlessMeshTransport implements IntercomTransport {
       return;
     }
 
-    // 1. Connect to ALL public MQTT brokers simultaneously (including Port 443 shiftr.io)
     for (const broker of PUBLIC_MQTT_BROKERS) {
       this.connectSingleMqttBroker(broker);
     }
+  }
 
-    // 2. Connect to Port-443 WebSocket Bridge (ntfy.sh over standard port 443)
-    this.connectPort443Bridge();
+  private subscribeClientDirectOnSocket(url: string, ws: WebSocket) {
+    if (!this.clientId || ws.readyState !== WebSocket.OPEN) return;
+    const key = `${url}::${this.clientId}`;
+    if (this.mqttSubscribedDirect.has(key)) return;
+    this.mqttSubscribedDirect.add(key);
+    try {
+      ws.send(buildMqttSubscribePacket(getDirectTopic(this.clientId), 2).buffer as ArrayBuffer);
+    } catch {
+      // Ignore
+    }
+  }
+
+  private subscribeClientDirectAll() {
+    if (!this.clientId) return;
+    for (const [url, ws] of this.mqttSockets.entries()) {
+      this.subscribeClientDirectOnSocket(url, ws);
+    }
   }
 
   private connectSingleMqttBroker(broker: MqttBrokerConfig) {
     if (this.closed) return;
     const { url, username, password } = broker;
     const existing = this.mqttSockets.get(url);
-    if (existing && (existing.readyState === WebSocket.OPEN || existing.readyState === WebSocket.CONNECTING)) {
+    if (
+      existing &&
+      (existing.readyState === WebSocket.OPEN || existing.readyState === WebSocket.CONNECTING)
+    ) {
       return;
     }
 
@@ -278,7 +309,8 @@ class ServerlessMeshTransport implements IntercomTransport {
         subscribed = true;
         try {
           ws.send(buildMqttSubscribePacket(MESH_TOPIC, 1).buffer as ArrayBuffer);
-          this.broadcastPresencePacket(false);
+          this.subscribeClientDirectOnSocket(url, ws);
+          this.broadcastPresencePacket();
         } catch {
           // Ignore
         }
@@ -288,13 +320,13 @@ class ServerlessMeshTransport implements IntercomTransport {
         if (this.closed) return;
         const mqttClientId = `dl_${Math.random().toString(36).slice(2, 10)}_${Date.now() % 10000}`;
         ws.send(buildMqttConnectPacket(mqttClientId, username, password).buffer as ArrayBuffer);
-        window.setTimeout(sendSubscribeOnce, 220);
+        window.setTimeout(sendSubscribeOnce, 200);
       };
 
       ws.onmessage = (ev) => {
         if (!(ev.data instanceof ArrayBuffer)) return;
         const chunk = new Uint8Array(ev.data);
-        if (!subscribed && chunk.length >= 2 && (chunk[0] >> 4) === 2) {
+        if (!subscribed && chunk.length >= 2 && chunk[0] >> 4 === 2) {
           // CONNACK received
           sendSubscribeOnce();
         }
@@ -306,7 +338,7 @@ class ServerlessMeshTransport implements IntercomTransport {
         rxBuffer = merged.slice(consumed);
 
         for (const raw of messages) {
-          this.handleWirePacket(raw);
+          this.handleWirePacket(raw, url);
         }
       };
 
@@ -318,57 +350,14 @@ class ServerlessMeshTransport implements IntercomTransport {
         if (this.mqttSockets.get(url) === ws) {
           this.mqttSockets.delete(url);
         }
+        if (this.clientId) {
+          this.mqttSubscribedDirect.delete(`${url}::${this.clientId}`);
+        }
         if (this.closed) return;
-        window.setTimeout(() => this.connectSingleMqttBroker(broker), 3500);
+        window.setTimeout(() => this.connectSingleMqttBroker(broker), 3200);
       };
     } catch {
       // Ignore individual broker failure
-    }
-  }
-
-  private connectPort443Bridge() {
-    if (this.closed) return;
-    if (
-      this.ntfyWs &&
-      (this.ntfyWs.readyState === WebSocket.OPEN || this.ntfyWs.readyState === WebSocket.CONNECTING)
-    ) {
-      return;
-    }
-
-    try {
-      const ws = new WebSocket(`wss://ntfy.sh/${NTFY_SIGNAL_TOPIC}/ws`);
-      this.ntfyWs = ws;
-
-      ws.onopen = () => {
-        if (this.closed) return;
-        this.broadcastPresencePacket(true);
-      };
-
-      ws.onmessage = (ev) => {
-        if (typeof ev.data !== 'string') return;
-        try {
-          const wrapper = JSON.parse(ev.data);
-          if (wrapper && wrapper.event === 'message' && typeof wrapper.message === 'string') {
-            this.handleWirePacket(wrapper.message);
-          }
-        } catch {
-          // Ignore malformed bridge packet
-        }
-      };
-
-      ws.onerror = () => {
-        // Handled in onclose
-      };
-
-      ws.onclose = () => {
-        if (this.ntfyWs === ws) {
-          this.ntfyWs = null;
-        }
-        if (this.closed) return;
-        window.setTimeout(() => this.connectPort443Bridge(), 4000);
-      };
-    } catch {
-      // Ignore bridge failure
     }
   }
 
@@ -384,7 +373,55 @@ class ServerlessMeshTransport implements IntercomTransport {
     }
   }
 
-  private publishWire(payload: Record<string, unknown>, options?: { isHighRateMedia?: boolean; forcePort443?: boolean }) {
+  private selectMediaSockets(targetId?: string): WebSocket[] {
+    const openEntries: Array<[string, WebSocket]> = [];
+    for (const [url, ws] of this.mqttSockets.entries()) {
+      if (ws.readyState === WebSocket.OPEN && ws.bufferedAmount < 64000) {
+        openEntries.push([url, ws]);
+      }
+    }
+    if (openEntries.length <= 2) {
+      return openEntries.map(([, ws]) => ws);
+    }
+
+    const chosen: WebSocket[] = [];
+    const chosenUrls = new Set<string>();
+
+    // 1. Prefer the broker over which we most recently heard from this peer
+    const peerLastBroker = targetId ? this.peers.get(targetId)?.lastBrokerUrl : undefined;
+    if (peerLastBroker) {
+      const found = openEntries.find(([u]) => u === peerLastBroker);
+      if (found) {
+        chosen.push(found[1]);
+        chosenUrls.add(found[0]);
+      }
+    }
+
+    // 2. Always include Port-443 shiftr.io if open (passes through mobile carrier firewalls)
+    for (const [u, ws] of openEntries) {
+      if (!chosenUrls.has(u) && u.includes(':443')) {
+        chosen.push(ws);
+        chosenUrls.add(u);
+        break;
+      }
+    }
+
+    // 3. Fill up to 2 sockets for redundancy without flooding all 4 brokers
+    for (const [u, ws] of openEntries) {
+      if (chosen.length >= 2) break;
+      if (!chosenUrls.has(u)) {
+        chosen.push(ws);
+        chosenUrls.add(u);
+      }
+    }
+
+    return chosen;
+  }
+
+  private publishWire(
+    payload: Record<string, unknown>,
+    options?: { isHighRateMedia?: boolean; directTargetId?: string }
+  ) {
     if (!this.clientId) return;
     const pktId = `${this.clientId}_${++this.pktSeq}_${Math.random().toString(36).slice(2, 6)}`;
     this.seenPacketIds.add(pktId);
@@ -407,40 +444,39 @@ class ServerlessMeshTransport implements IntercomTransport {
       // Ignore
     }
 
-    const mqttPacket = buildMqttPublishPacket(MESH_TOPIC, raw).buffer as ArrayBuffer;
-    for (const ws of this.mqttSockets.values()) {
-      if (ws.readyState === WebSocket.OPEN) {
+    const targetId = options?.directTargetId || (typeof payload.targetId === 'string' ? payload.targetId : '');
+
+    if (options?.isHighRateMedia && targetId) {
+      // High-rate video frames and voice audio chunks go ONLY to the partner's direct topic
+      // on the top 2 fastest sockets so we never self-echo or congest mobile connections!
+      const directPacket = buildMqttPublishPacket(getDirectTopic(targetId), raw).buffer as ArrayBuffer;
+      const sockets = this.selectMediaSockets(targetId);
+      for (const ws of sockets) {
         try {
-          ws.send(mqttPacket);
+          ws.send(directPacket);
         } catch {
           // Ignore
         }
       }
+      return;
     }
 
-    // Also send key control/signaling packets over ntfy.sh Port 443 (throttled to avoid HTTP 429 rate-limiting)
-    if (
-      !options?.isHighRateMedia &&
-      raw.length <= 3900 &&
-      !(typeof navigator !== 'undefined' && navigator.webdriver)
-    ) {
-      const isPresence = payload._mesh === 'presence';
-      const now = Date.now();
-      const canSendPresence = isPresence && (options?.forcePort443 || now - this.lastNtfyPresencePostAt >= 12000);
-      const canSendSignal = !isPresence && options?.forcePort443 && now - this.lastNtfyPostAt >= 180;
+    // Control, signaling, and presence packets go to all open brokers
+    const roomPacket = buildMqttPublishPacket(MESH_TOPIC, raw).buffer as ArrayBuffer;
+    const directPacket = targetId
+      ? (buildMqttPublishPacket(getDirectTopic(targetId), raw).buffer as ArrayBuffer)
+      : null;
 
-      if (canSendPresence || canSendSignal) {
-        this.lastNtfyPostAt = now;
-        if (isPresence) {
-          this.lastNtfyPresencePostAt = now;
-        }
-        fetch(`https://ntfy.sh/${NTFY_SIGNAL_TOPIC}`, {
-          method: 'POST',
-          body: raw,
-          keepalive: payload._mesh === 'leave',
-        }).catch(() => {
+    for (const ws of this.mqttSockets.values()) {
+      if (ws.readyState === WebSocket.OPEN) {
+        try {
+          if (directPacket) {
+            ws.send(directPacket);
+          }
+          ws.send(roomPacket);
+        } catch {
           // Ignore
-        });
+        }
       }
     }
   }
@@ -545,18 +581,15 @@ class ServerlessMeshTransport implements IntercomTransport {
     });
   }
 
-  private broadcastPresencePacket(forcePort443 = false) {
+  private broadcastPresencePacket() {
     if (!this.clientId || !this.pin) return;
-    this.publishWire(
-      {
-        _mesh: 'presence',
-        pin: this.pin,
-        inRoulette: this.inRoulette,
-        rouletteJoinedAt: this.rouletteJoinedAt,
-        callId: this.callId,
-      },
-      { forcePort443 }
-    );
+    this.publishWire({
+      _mesh: 'presence',
+      pin: this.pin,
+      inRoulette: this.inRoulette,
+      rouletteJoinedAt: this.rouletteJoinedAt,
+      callId: this.callId,
+    });
     this.emitPresenceToApp();
   }
 
@@ -578,7 +611,7 @@ class ServerlessMeshTransport implements IntercomTransport {
       this.emitToApp({
         type: 'roulette:searching',
       });
-      this.broadcastPresencePacket(true);
+      this.broadcastPresencePacket();
       window.setTimeout(() => {
         if (!this.closed && this.inRoulette && !this.callId) {
           this.tryMatchRouletteInMesh(false);
@@ -589,7 +622,7 @@ class ServerlessMeshTransport implements IntercomTransport {
         type: 'call:ended',
         reason: 'hangup',
       });
-      this.broadcastPresencePacket(true);
+      this.broadcastPresencePacket();
     }
   }
 
@@ -635,7 +668,7 @@ class ServerlessMeshTransport implements IntercomTransport {
           callId,
           callerPin: this.pin,
         },
-        { forcePort443: true }
+        { directTargetId: partner.clientId }
       );
 
       this.emitToApp({
@@ -644,11 +677,11 @@ class ServerlessMeshTransport implements IntercomTransport {
         peerPin: partner.pin,
         initiator: true,
       });
-      this.broadcastPresencePacket(true);
+      this.broadcastPresencePacket();
     }
   }
 
-  private handleWirePacket(raw: string) {
+  private handleWirePacket(raw: string, sourceBrokerUrl?: string) {
     let pkt: Record<string, any>;
     try {
       pkt = JSON.parse(raw);
@@ -664,6 +697,14 @@ class ServerlessMeshTransport implements IntercomTransport {
 
     const fromId = String(pkt._fromId || '');
     if (!fromId || fromId === this.clientId) return;
+
+    const existingPeer = this.peers.get(fromId);
+    if (existingPeer) {
+      existingPeer.lastSeen = Date.now();
+      if (sourceBrokerUrl) {
+        existingPeer.lastBrokerUrl = sourceBrokerUrl;
+      }
+    }
 
     const meshType = String(pkt._mesh || '');
 
@@ -697,6 +738,7 @@ class ServerlessMeshTransport implements IntercomTransport {
         rouletteJoinedAt: Number(pkt.rouletteJoinedAt) || Date.now(),
         callId: pkt.callId ? String(pkt.callId) : null,
         lastSeen: Date.now(),
+        lastBrokerUrl: sourceBrokerUrl || existingPeer?.lastBrokerUrl,
       });
 
       this.emitPresenceToApp();
@@ -712,7 +754,7 @@ class ServerlessMeshTransport implements IntercomTransport {
             callId: this.callId,
             isReply: true,
           },
-          { forcePort443: true }
+          { directTargetId: fromId }
         );
       }
 
@@ -757,7 +799,7 @@ class ServerlessMeshTransport implements IntercomTransport {
         peerPin: callerPin,
         initiator: false,
       });
-      this.broadcastPresencePacket(true);
+      this.broadcastPresencePacket();
       return;
     }
 
@@ -769,7 +811,7 @@ class ServerlessMeshTransport implements IntercomTransport {
             targetId: fromId,
             callId: pkt.callId,
           },
-          { forcePort443: true }
+          { directTargetId: fromId }
         );
         return;
       }
@@ -786,7 +828,7 @@ class ServerlessMeshTransport implements IntercomTransport {
         callId,
         fromPin: callerPin,
       });
-      this.broadcastPresencePacket(true);
+      this.broadcastPresencePacket();
       return;
     }
 
@@ -802,7 +844,7 @@ class ServerlessMeshTransport implements IntercomTransport {
           status: 'busy',
           targetPin,
         });
-        this.broadcastPresencePacket(true);
+        this.broadcastPresencePacket();
       }
       return;
     }
@@ -818,7 +860,7 @@ class ServerlessMeshTransport implements IntercomTransport {
           initiator: true,
           mode: this.callMode,
         });
-        this.broadcastPresencePacket(true);
+        this.broadcastPresencePacket();
       }
       return;
     }
@@ -841,7 +883,7 @@ class ServerlessMeshTransport implements IntercomTransport {
           initiator: false,
           mode: this.callMode,
         });
-        this.broadcastPresencePacket(true);
+        this.broadcastPresencePacket();
       }
       return;
     }
@@ -878,9 +920,10 @@ class ServerlessMeshTransport implements IntercomTransport {
     if (type === 'ping') {
       // Driven by App.tsx's unthrottled background Web Worker every 10s so background tabs stay connected on GitHub Pages
       this.connectAllTransports();
+      this.subscribeClientDirectAll();
       this.sendMqttPingAll();
       this.pruneStalePeers();
-      this.broadcastPresencePacket(false);
+      this.broadcastPresencePacket();
       this.emitToApp({
         type: 'pong',
         ts: Date.now(),
@@ -895,6 +938,8 @@ class ServerlessMeshTransport implements IntercomTransport {
         rawClientId && /^[a-zA-Z0-9_-]{4,64}$/.test(rawClientId)
           ? rawClientId
           : `u_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+      this.subscribeClientDirectAll();
 
       let savedPin = String(msg.preferredPin || '').trim();
       if (!savedPin) {
@@ -960,7 +1005,7 @@ class ServerlessMeshTransport implements IntercomTransport {
                     callId: this.callId,
                     mode: this.callMode,
                   },
-                  { forcePort443: true }
+                  { directTargetId: this.partnerClientId }
                 );
               }
             }, 320);
@@ -970,7 +1015,7 @@ class ServerlessMeshTransport implements IntercomTransport {
         // Ignore
       }
 
-      this.broadcastPresencePacket(true);
+      this.broadcastPresencePacket();
       return;
     }
 
@@ -1019,7 +1064,7 @@ class ServerlessMeshTransport implements IntercomTransport {
         ok: true,
         pin: this.pin,
       });
-      this.broadcastPresencePacket(true);
+      this.broadcastPresencePacket();
       return;
     }
 
@@ -1076,7 +1121,7 @@ class ServerlessMeshTransport implements IntercomTransport {
           targetId: targetPeer.clientId,
           callId,
         },
-        { forcePort443: true }
+        { directTargetId: targetPeer.clientId }
       );
 
       this.emitToApp({
@@ -1084,7 +1129,7 @@ class ServerlessMeshTransport implements IntercomTransport {
         callId,
         targetPin: targetPeer.pin,
       });
-      this.broadcastPresencePacket(true);
+      this.broadcastPresencePacket();
       return;
     }
 
@@ -1097,7 +1142,7 @@ class ServerlessMeshTransport implements IntercomTransport {
           targetId: this.partnerClientId,
           callId: this.callId,
         },
-        { forcePort443: true }
+        { directTargetId: this.partnerClientId }
       );
 
       this.emitToApp({
@@ -1107,7 +1152,7 @@ class ServerlessMeshTransport implements IntercomTransport {
         initiator: false,
         mode: this.callMode,
       });
-      this.broadcastPresencePacket(true);
+      this.broadcastPresencePacket();
       return;
     }
 
@@ -1119,7 +1164,7 @@ class ServerlessMeshTransport implements IntercomTransport {
             targetId: this.partnerClientId,
             callId: this.callId,
           },
-          { forcePort443: true }
+          { directTargetId: this.partnerClientId }
         );
       }
       this.callId = null;
@@ -1133,7 +1178,7 @@ class ServerlessMeshTransport implements IntercomTransport {
         type: 'call:ended',
         reason: 'hangup',
       });
-      this.broadcastPresencePacket(true);
+      this.broadcastPresencePacket();
       return;
     }
 
@@ -1150,7 +1195,7 @@ class ServerlessMeshTransport implements IntercomTransport {
             targetId: this.partnerClientId,
             callId: this.callId,
           },
-          { forcePort443: true }
+          { directTargetId: this.partnerClientId }
         );
       } else if (type === 'roulette:start') {
         this.lastPartnerClientId = null;
@@ -1165,7 +1210,7 @@ class ServerlessMeshTransport implements IntercomTransport {
       this.emitToApp({
         type: 'roulette:searching',
       });
-      this.broadcastPresencePacket(true);
+      this.broadcastPresencePacket();
       this.tryMatchRouletteInMesh(true);
       return;
     }
@@ -1178,7 +1223,7 @@ class ServerlessMeshTransport implements IntercomTransport {
             targetId: this.partnerClientId,
             callId: this.callId,
           },
-          { forcePort443: true }
+          { directTargetId: this.partnerClientId }
         );
       }
       this.callId = null;
@@ -1191,7 +1236,7 @@ class ServerlessMeshTransport implements IntercomTransport {
       this.emitToApp({
         type: 'roulette:stopped',
       });
-      this.broadcastPresencePacket(true);
+      this.broadcastPresencePacket();
       return;
     }
 
@@ -1219,14 +1264,14 @@ class ServerlessMeshTransport implements IntercomTransport {
               timestamp: Number(msg.timestamp) || Date.now(),
             },
           },
-          { forcePort443: true }
+          { directTargetId: this.partnerClientId }
         );
         return;
       }
 
       if (type === 'media:frame') {
         const now = Date.now();
-        if (now - this.lastFrameRelayAt < 210) {
+        if (now - this.lastFrameRelayAt < 140) {
           return;
         }
         this.lastFrameRelayAt = now;
@@ -1236,14 +1281,15 @@ class ServerlessMeshTransport implements IntercomTransport {
             targetId: this.partnerClientId,
             payload: msg,
           },
-          { isHighRateMedia: true }
+          { isHighRateMedia: true, directTargetId: this.partnerClientId }
         );
         return;
       }
 
       if (type === 'media:audio') {
         const now = Date.now();
-        if (now - this.lastAudioRelayAt < 130) {
+        // Audio chunks arrive every ~160ms; only guard against accidental <45ms duplicate bursts so 0 voice chunks are dropped!
+        if (now - this.lastAudioRelayAt < 45) {
           return;
         }
         this.lastAudioRelayAt = now;
@@ -1253,7 +1299,7 @@ class ServerlessMeshTransport implements IntercomTransport {
             targetId: this.partnerClientId,
             payload: msg,
           },
-          { isHighRateMedia: true }
+          { isHighRateMedia: true, directTargetId: this.partnerClientId }
         );
         return;
       }
@@ -1264,7 +1310,7 @@ class ServerlessMeshTransport implements IntercomTransport {
           targetId: this.partnerClientId,
           payload: msg,
         },
-        { forcePort443: type !== 'webrtc:ice' }
+        { directTargetId: this.partnerClientId }
       );
     }
   }
@@ -1273,7 +1319,7 @@ class ServerlessMeshTransport implements IntercomTransport {
     if (this.closed) return;
     this.closed = true;
     this.readyState = WS_CLOSED;
-    this.publishWire({ _mesh: 'leave' }, { forcePort443: true });
+    this.publishWire({ _mesh: 'leave' });
     if (this.heartbeatTimer) window.clearInterval(this.heartbeatTimer);
     if (this.pingTimer) window.clearInterval(this.pingTimer);
     for (const ws of this.mqttSockets.values()) {
@@ -1284,12 +1330,7 @@ class ServerlessMeshTransport implements IntercomTransport {
       }
     }
     this.mqttSockets.clear();
-    try {
-      this.ntfyWs?.close();
-    } catch {
-      // Ignore
-    }
-    this.ntfyWs = null;
+    this.mqttSubscribedDirect.clear();
     try {
       this.bc?.close();
     } catch {
@@ -1452,7 +1493,7 @@ export function createIntercomTransport(): IntercomTransport {
       };
 
       ws.onerror = () => {
-        if (!connectedOnce && !closed) {
+        if (!connectedOnce) {
           window.clearTimeout(fallbackTimer);
           triggerFailureOnce();
         }
@@ -1460,7 +1501,7 @@ export function createIntercomTransport(): IntercomTransport {
 
       ws.onclose = () => {
         window.clearTimeout(fallbackTimer);
-        if (!connectedOnce && !closed) {
+        if (!connectedOnce) {
           triggerFailureOnce();
         } else if (!closed) {
           wrapper.onclose?.();
@@ -1469,8 +1510,7 @@ export function createIntercomTransport(): IntercomTransport {
     } catch {
       handleInitialConnectFailure();
     }
-  }, 15);
+  }, 50);
 
   return wrapper;
 }
-

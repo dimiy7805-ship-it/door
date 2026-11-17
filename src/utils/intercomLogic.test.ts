@@ -14,6 +14,7 @@ import {
   PUBLIC_SITE_URL,
   resolveShareableSiteUrl,
 } from './intercomLogic';
+import { encodePcm8Base64, decodePcm8Base64 } from './soundEngine';
 
 test('validatePin accepts 1 to 5 digits without leading zero', () => {
   assert.deepEqual(validatePin('50'), { valid: true, normalized: '50' });
@@ -205,4 +206,16 @@ test('resolveShareableSiteUrl returns clean GitHub Pages URL or custom productio
   assert.equal(resolveShareableSiteUrl('https://domofon.example.com/app?foo=bar'), 'https://domofon.example.com/app/');
 });
 
-
+test('encodePcm8Base64 and decodePcm8Base64 roundtrip voice waveform accurately with compact payload', () => {
+  const input = new Float32Array(1280);
+  for (let i = 0; i < input.length; i++) {
+    input[i] = Math.sin((i / 20) * Math.PI * 2) * 0.65;
+  }
+  const encoded = encodePcm8Base64(input);
+  assert.equal(encoded.length < 1800, true);
+  const decoded = decodePcm8Base64(encoded);
+  assert.equal(decoded.length, input.length);
+  for (let i = 0; i < input.length; i++) {
+    assert.equal(Math.abs(decoded[i] - input[i]) < 0.03, true);
+  }
+});
