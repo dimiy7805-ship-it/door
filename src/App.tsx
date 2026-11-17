@@ -25,7 +25,6 @@ const RTC_CONFIG: RTCConfiguration = {
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:stun2.l.google.com:19302' },
-    { urls: 'stun:stun.cloudflare.com:3478' },
     {
       urls: [
         'turn:openrelay.metered.ca:80',
@@ -38,8 +37,31 @@ const RTC_CONFIG: RTCConfiguration = {
       credential: 'openrelayproject',
     },
   ],
-  iceCandidatePoolSize: 4,
+  iceCandidatePoolSize: 2,
 };
+
+function waitForIceGatheringBrief(pc: RTCPeerConnection, timeoutMs = 280): Promise<void> {
+  if (pc.iceGatheringState === 'complete') {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      pc.removeEventListener('icegatheringstatechange', onState);
+      window.clearTimeout(timer);
+      resolve();
+    };
+    const onState = () => {
+      if (pc.iceGatheringState === 'complete') {
+        finish();
+      }
+    };
+    const timer = window.setTimeout(finish, timeoutMs);
+    pc.addEventListener('icegatheringstatechange', onState);
+  });
+}
 
 const LEASE_TTL_MS = 4500;
 
@@ -596,6 +618,7 @@ export default function App() {
                 offerToReceiveVideo: true,
               });
               await existingPc.setLocalDescription(offer);
+              await waitForIceGatheringBrief(existingPc, 280);
               sendWs({
                 type: 'webrtc:offer',
                 sdp: existingPc.localDescription,
@@ -625,6 +648,9 @@ export default function App() {
           const combinedRemote = new MediaStream();
           remoteStreamRef.current = combinedRemote;
 
+          let initialSdpSent = false;
+          let trickleIceSentCount = 0;
+
           const updateConnectedState = () => {
             if (pcRef.current !== pc) return;
             const isConn =
@@ -641,7 +667,11 @@ export default function App() {
           pc.oniceconnectionstatechange = updateConnectedState;
 
           pc.onicecandidate = (event) => {
-            if (event.candidate && pcRef.current === pc) {
+            if (!event.candidate || pcRef.current !== pc) return;
+            // Only trickle late candidates (up to 3 max) that arrive AFTER the bundled SDP was sent,
+            // so we never trigger broker packet-burst rate limiters!
+            if (initialSdpSent && trickleIceSentCount < 3) {
+              trickleIceSentCount++;
               sendWs({
                 type: 'webrtc:ice',
                 candidate: event.candidate,
@@ -699,16 +729,28 @@ export default function App() {
             });
           }
 
-          if (initiator && pc.signalingState === 'stable') {
+          const createAndSendBundledOffer = async () => {
+            if (pcRef.current !== pc || pc.signalingState !== 'stable' || pc.remoteDescription) {
+              return;
+            }
             const offer = await pc.createOffer({
               offerToReceiveAudio: true,
               offerToReceiveVideo: true,
             });
             await pc.setLocalDescription(offer);
-            sendWs({
-              type: 'webrtc:offer',
-              sdp: pc.localDescription,
-            });
+            // Bundle host + STUN ICE candidates directly into the single webrtc:offer packet!
+            await waitForIceGatheringBrief(pc, 280);
+            initialSdpSent = true;
+            if (pcRef.current === pc && pc.localDescription) {
+              sendWs({
+                type: 'webrtc:offer',
+                sdp: pc.localDescription,
+              });
+            }
+          };
+
+          if (initiator && pc.signalingState === 'stable') {
+            await createAndSendBundledOffer();
 
             // ONLY retry sending webrtc:offer if we are STILL waiting in 'have-local-offer' (no answer received yet!)
             webrtcOfferRetryTimerRef.current = window.setTimeout(() => {
@@ -732,9 +774,22 @@ export default function App() {
                       sdp: pc.localDescription,
                     });
                   }
-                }, 1700);
+                }, 1900);
               }
-            }, 1100);
+            }, 1300);
+          } else if (!initiator) {
+            // If callee hasn't received caller's offer within 1.8s (e.g., caller transitioned slightly later),
+            // callee initiates a bundled offer (polite rollback in webrtc:offer handles any simultaneous glare).
+            webrtcOfferRetryTimerRef.current = window.setTimeout(() => {
+              if (
+                pcRef.current === pc &&
+                pc.signalingState === 'stable' &&
+                !pc.remoteDescription &&
+                !webrtcConnectedRef.current
+              ) {
+                createAndSendBundledOffer().catch(() => {});
+              }
+            }, 1800);
           }
 
           return pc;
@@ -792,6 +847,23 @@ export default function App() {
         lastAudioBytesRx = curAudioBytes;
         lastVideoBytesRx = curVideoBytes;
 
+        // Snapshot live WebRTC video to backup canvas once per second without triggering React re-renders
+        const remVideo = remoteVideoRef.current;
+        const remCanvas = remoteCanvasDisplayRef.current;
+        if (videoFlowing && remVideo && remVideo.readyState >= 2 && remCanvas) {
+          if (
+            remCanvas.width !== remVideo.videoWidth ||
+            remCanvas.height !== remVideo.videoHeight
+          ) {
+            remCanvas.width = remVideo.videoWidth;
+            remCanvas.height = remVideo.videoHeight;
+          }
+          const rCtx = remCanvas.getContext('2d');
+          if (rCtx) {
+            rCtx.drawImage(remVideo, 0, 0, remCanvas.width, remCanvas.height);
+          }
+        }
+
         const changed =
           webrtcAudioRxRef.current !== audioFlowing || webrtcVideoRxRef.current !== videoFlowing;
         webrtcAudioRxRef.current = audioFlowing;
@@ -812,36 +884,12 @@ export default function App() {
     }, 1000);
 
     const sendFrameNow = () => {
-      const remVideo = remoteVideoRef.current;
-      const remCanvas = remoteCanvasDisplayRef.current;
-
-      if (
-        webrtcVideoRxRef.current &&
-        remVideo &&
-        remVideo.readyState >= 2 &&
-        remVideo.videoWidth > 0 &&
-        remCanvas
-      ) {
-        if (
-          remCanvas.width !== remVideo.videoWidth ||
-          remCanvas.height !== remVideo.videoHeight
-        ) {
-          remCanvas.width = remVideo.videoWidth;
-          remCanvas.height = remVideo.videoHeight;
-        }
-        const rCtx = remCanvas.getContext('2d');
-        if (rCtx) {
-          rCtx.drawImage(remVideo, 0, 0, remCanvas.width, remCanvas.height);
-          setRemoteFrameSeq((s) => s + 1);
-        }
-      }
-
       const isServerless = wsRef.current?.mode === 'serverless';
       const now = Date.now();
       const minInterval = peerWebrtcVideoRxRef.current
         ? 2500
         : isServerless
-          ? 165
+          ? 210
           : 110;
       if (now - lastFallbackFrameSentAt < minInterval) {
         return;
@@ -853,7 +901,7 @@ export default function App() {
       const ctx = capCanvas.getContext('2d');
       if (!ctx) return;
 
-      const maxDim = isServerless ? 200 : 380;
+      const maxDim = isServerless ? 216 : 380;
       const videoEl = localVideoRef.current;
       if (camEnabledRef.current && videoEl && videoEl.readyState >= 2 && videoEl.videoWidth > 0) {
         const vw = videoEl.videoWidth || 480;
@@ -883,7 +931,7 @@ export default function App() {
       }
 
       try {
-        const dataUrl = capCanvas.toDataURL('image/jpeg', isServerless ? 0.48 : 0.68);
+        const dataUrl = capCanvas.toDataURL('image/jpeg', isServerless ? 0.5 : 0.68);
         sendWs({
           type: 'media:frame',
           frame: dataUrl,
@@ -904,7 +952,7 @@ export default function App() {
     });
 
     sendFrameNow();
-    const timer = window.setInterval(sendFrameNow, 85);
+    const timer = window.setInterval(sendFrameNow, 105);
 
     let audioCtx: AudioContext | null = null;
     let workletNode: AudioWorkletNode | null = null;
@@ -933,7 +981,7 @@ export default function App() {
           audioCtx.resume().catch(() => {});
         }
         const inRate = audioCtx.sampleRate || 48000;
-        const targetRate = 8000;
+        const targetRate = 10000;
         const step = Math.max(1, inRate / targetRate);
         const outRate = Math.round(inRate / step);
 
@@ -943,16 +991,22 @@ export default function App() {
         silentGain.connect(audioCtx.destination);
 
         let accum: number[] = [];
-        const CHUNK_SAMPLES = 1280; // 160ms at 8000Hz -> ~1.7 KB Base64 PCM8 packet
+        const CHUNK_SAMPLES = 2200; // 220ms at 10kHz -> ~2.9 KB Base64 PCM8 packet (only 4.5 pkt/sec!)
 
         const pushInputSamples = (input: Float32Array) => {
           if (!micEnabledRef.current || peerWebrtcAudioRxRef.current) {
             accum = [];
             return;
           }
+          const span = Math.max(1, Math.floor(step));
           for (let i = 0; i < input.length; i += step) {
-            const idx = Math.min(input.length - 1, Math.floor(i));
-            accum.push(input[idx]);
+            const startIdx = Math.min(input.length - 1, Math.floor(i));
+            const endIdx = Math.min(input.length, startIdx + span);
+            let sum = 0;
+            for (let k = startIdx; k < endIdx; k++) {
+              sum += input[k];
+            }
+            accum.push(sum / Math.max(1, endIdx - startIdx));
           }
           while (accum.length >= CHUNK_SAMPLES) {
             const slice = accum.splice(0, CHUNK_SAMPLES);
@@ -961,7 +1015,7 @@ export default function App() {
               const a = Math.abs(slice[j]);
               if (a > peak) peak = a;
             }
-            if (peak >= 0.004) {
+            if (peak >= 0.0035) {
               sendWs({
                 type: 'media:audio',
                 pcm8: encodePcm8Base64(slice),
@@ -1350,6 +1404,10 @@ export default function App() {
 
           case 'webrtc:offer': {
             try {
+              if (webrtcOfferRetryTimerRef.current !== null) {
+                window.clearTimeout(webrtcOfferRetryTimerRef.current);
+                webrtcOfferRetryTimerRef.current = null;
+              }
               let pc = pcRef.current;
               if (!pc || pc.signalingState === 'closed' || pcInitPromiseRef.current) {
                 pc = await startWebRtcSession(false);
@@ -1376,10 +1434,14 @@ export default function App() {
                 await flushPendingIceCandidates(pc);
                 const answer = await pc.createAnswer();
                 await pc.setLocalDescription(answer);
-                sendWs({
-                  type: 'webrtc:answer',
-                  sdp: pc.localDescription,
-                });
+                // Bundle host + STUN ICE candidates directly into the single webrtc:answer packet!
+                await waitForIceGatheringBrief(pc, 280);
+                if (pcRef.current === pc && pc.localDescription) {
+                  sendWs({
+                    type: 'webrtc:answer',
+                    sdp: pc.localDescription,
+                  });
+                }
               }
             } catch {
               // Ignore

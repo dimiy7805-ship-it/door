@@ -2696,6 +2696,9 @@ export const IntercomScene3D: React.FC<IntercomScene3DProps> = ({
       ctx.restore();
     }
 
+    let lastOpticsDrawAt = 0;
+    let lastOpticsCamState: boolean | null = null;
+
     function drawVideoScreenNow() {
       const ctx = videoScreenCanvas.getContext('2d')!;
       const w = videoScreenCanvas.width; // 512
@@ -2720,11 +2723,16 @@ export const IntercomScene3D: React.FC<IntercomScene3DProps> = ({
       const remoteVideo = remoteVideoElementRef?.current;
       const remoteCanvas = remoteVideoCanvasRef?.current;
 
-      // Update the 3D intercom's circular optical camera lens with a darkened fisheye reflection & dynamic light glare!
-      const camDx = THREE.MathUtils.clamp((camera.position.x - controls.target.x) / 3.2, -1, 1);
-      const camDy = THREE.MathUtils.clamp((camera.position.y - controls.target.y) / 3.2, -1, 1);
-      renderCameraOpticsCanvas(cameraOpticsCanvas, localVideo, isCamOn, mirrorSelf, camDx, camDy);
-      cameraOpticsTex.needsUpdate = true;
+      // Throttle heavy 9-ring fisheye optics lens rendering so it never starves main-thread video/audio during calls
+      const nowMs = performance.now();
+      if (nowMs - lastOpticsDrawAt >= 350 || lastOpticsCamState !== isCamOn) {
+        lastOpticsDrawAt = nowMs;
+        lastOpticsCamState = isCamOn;
+        const camDx = THREE.MathUtils.clamp((camera.position.x - controls.target.x) / 3.2, -1, 1);
+        const camDy = THREE.MathUtils.clamp((camera.position.y - controls.target.y) / 3.2, -1, 1);
+        renderCameraOpticsCanvas(cameraOpticsCanvas, localVideo, isCamOn, mirrorSelf, camDx, camDy);
+        cameraOpticsTex.needsUpdate = true;
+      }
 
       ctx.fillStyle = '#090b0e';
       ctx.fillRect(0, 0, w, h);

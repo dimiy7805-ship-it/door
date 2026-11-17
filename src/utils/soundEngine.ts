@@ -207,35 +207,39 @@ class IntercomSoundEngine {
     if (!ctx || samples.length === 0) return;
 
     try {
-      const safeRate = Math.max(4000, Math.min(48000, sampleRate || 8000));
+      const safeRate = Math.max(4000, Math.min(48000, sampleRate || 10000));
       const buffer = ctx.createBuffer(1, samples.length, safeRate);
       const channel = buffer.getChannelData(0);
-      // Apply 4ms micro-fade at chunk edges to eliminate any click/pop if network packets jitter
-      const fadeLen = Math.min(32, Math.floor(samples.length / 8));
+
+      const now = ctx.currentTime;
+      const isUnderrun = this.nextPcmPlayTime < now || this.nextPcmPlayTime > now + 1.1;
+      if (isUnderrun) {
+        // 110ms jitter buffer on initial chunk so consecutive network chunks play back-to-back without underruns
+        this.nextPcmPlayTime = now + 0.11;
+      }
+
+      // Only apply a short 16-sample ramp at the very start of a new speech burst after an underrun;
+      // contiguous chunks must NOT dip to 0 at boundaries (which caused 5Hz voice tremolo/chop).
+      const fadeInLen = isUnderrun ? Math.min(24, Math.floor(samples.length / 8)) : 0;
       for (let i = 0; i < samples.length; i++) {
-        let env = 1.0;
-        if (i < fadeLen) {
-          env = i / fadeLen;
-        } else if (i >= samples.length - fadeLen) {
-          env = (samples.length - 1 - i) / fadeLen;
-        }
+        const env = i < fadeInLen ? i / fadeInLen : 1.0;
         channel[i] = samples[i] * env;
       }
 
       const source = ctx.createBufferSource();
       source.buffer = buffer;
 
-      const gainNode = ctx.createGain();
-      gainNode.gain.value = 1.55;
+      const filterNode = ctx.createBiquadFilter();
+      filterNode.type = 'lowpass';
+      filterNode.frequency.value = Math.min(4100, safeRate * 0.44);
 
-      source.connect(gainNode);
+      const gainNode = ctx.createGain();
+      gainNode.gain.value = 1.45;
+
+      source.connect(filterNode);
+      filterNode.connect(gainNode);
       gainNode.connect(ctx.destination);
 
-      const now = ctx.currentTime;
-      if (this.nextPcmPlayTime < now || this.nextPcmPlayTime > now + 0.85) {
-        // 75ms jitter buffer so consecutive network chunks play back-to-back seamlessly
-        this.nextPcmPlayTime = now + 0.075;
-      }
       source.start(this.nextPcmPlayTime);
       this.nextPcmPlayTime += buffer.duration;
     } catch {
