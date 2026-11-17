@@ -97,10 +97,13 @@ function buildMqttConnectPacket(
   return new Uint8Array([0x10, ...encodeRemainingLength(remLen), ...varHeader, ...payload]);
 }
 
-function buildMqttSubscribePacket(topic: string, packetId = 1): Uint8Array {
-  const tBytes = encodeUtf8(topic);
+function buildMqttMultiSubscribePacket(topics: string[], packetId = 1): Uint8Array {
   const varHeader = [(packetId >> 8) & 0xff, packetId & 0xff];
-  const payload = [(tBytes.length >> 8) & 0xff, tBytes.length & 0xff, ...tBytes, 0x00];
+  const payload: number[] = [];
+  for (const topic of topics) {
+    const tBytes = encodeUtf8(topic);
+    payload.push((tBytes.length >> 8) & 0xff, tBytes.length & 0xff, ...tBytes, 0x00);
+  }
   const remLen = varHeader.length + payload.length;
   return new Uint8Array([0x82, ...encodeRemainingLength(remLen), ...varHeader, ...payload]);
 }
@@ -179,6 +182,7 @@ interface MeshPeerState {
   callId: string | null;
   lastSeen: number;
   lastBrokerUrl?: string;
+  verifiedBrokers?: Set<string>;
 }
 
 interface SocketOutbox {
@@ -384,7 +388,7 @@ class ServerlessMeshTransport implements IntercomTransport {
       }
     } else if (category === 'audio') {
       box.audioQueue.push(packet);
-      // Keep audio real-time: cap buffered audio chunks at 4 (~880ms max)
+      // Keep audio real-time: cap buffered audio chunks at 4 (~750ms max)
       while (box.audioQueue.length > 4) {
         box.audioQueue.shift();
       }
@@ -399,14 +403,15 @@ class ServerlessMeshTransport implements IntercomTransport {
   }
 
   private subscribeClientDirectOnSocket(url: string, ws: WebSocket) {
-    if (!this.clientId || ws.readyState !== WebSocket.OPEN || !this.mqttConnackSet.has(url)) {
+    if (ws.readyState !== WebSocket.OPEN || !this.mqttConnackSet.has(url)) {
       return;
     }
-    const key = `${url}::${this.clientId}`;
+    const key = `${url}::${this.clientId || 'anon'}`;
     if (this.mqttSubscribedDirect.has(key)) return;
     this.mqttSubscribedDirect.add(key);
     try {
-      ws.send(buildMqttSubscribePacket(getDirectTopic(this.clientId), 2).buffer as ArrayBuffer);
+      const topics = this.clientId ? [MESH_TOPIC, getDirectTopic(this.clientId)] : [MESH_TOPIC];
+      ws.send(buildMqttMultiSubscribePacket(topics, 1).buffer as ArrayBuffer);
     } catch {
       // Ignore
     }
@@ -441,11 +446,11 @@ class ServerlessMeshTransport implements IntercomTransport {
       const sendSubscriptionsAfterConnack = () => {
         if (ws.readyState !== WebSocket.OPEN) return;
         this.mqttConnackSet.add(url);
+        this.mqttSubscribedDirect.delete(`${url}::anon`);
         if (this.clientId) {
           this.mqttSubscribedDirect.delete(`${url}::${this.clientId}`);
         }
         try {
-          ws.send(buildMqttSubscribePacket(MESH_TOPIC, 1).buffer as ArrayBuffer);
           this.subscribeClientDirectOnSocket(url, ws);
           window.setTimeout(() => {
             if (!this.closed && this.mqttSockets.get(url) === ws) {
@@ -473,7 +478,7 @@ class ServerlessMeshTransport implements IntercomTransport {
         if (!(ev.data instanceof ArrayBuffer)) return;
         const chunk = new Uint8Array(ev.data);
         if (chunk.length >= 2 && chunk[0] >> 4 === 2) {
-          // Authentic MQTT CONNACK received: always send SUBSCRIBE now that session is active
+          // Authentic MQTT CONNACK received: send atomic multi-topic SUBSCRIBE now that session is active
           sendSubscriptionsAfterConnack();
         }
         const merged = new Uint8Array(rxBuffer.length + chunk.length);
@@ -503,6 +508,7 @@ class ServerlessMeshTransport implements IntercomTransport {
           box.timer = null;
         }
         this.socketOutboxes.delete(url);
+        this.mqttSubscribedDirect.delete(`${url}::anon`);
         if (this.clientId) {
           this.mqttSubscribedDirect.delete(`${url}::${this.clientId}`);
         }
@@ -543,19 +549,34 @@ class ServerlessMeshTransport implements IntercomTransport {
 
     const chosen: Array<[string, WebSocket]> = [];
     const chosenUrls = new Set<string>();
+    const peer = targetId ? this.peers.get(targetId) : undefined;
 
     // 1. Prefer the broker over which we most recently heard from this peer
-    const peerLastBroker = targetId ? this.peers.get(targetId)?.lastBrokerUrl : undefined;
-    if (peerLastBroker) {
-      const found = openEntries.find(([u]) => u === peerLastBroker);
+    if (peer?.lastBrokerUrl) {
+      const found = openEntries.find(([u]) => u === peer.lastBrokerUrl);
       if (found) {
         chosen.push(found);
         chosenUrls.add(found[0]);
       }
     }
 
-    // 2. Always include Port-443 shiftr.io if open (passes through mobile carrier firewalls)
+    // 2. Include any other verified broker from which we have received packets from this peer
+    if (peer?.verifiedBrokers) {
+      for (const vb of peer.verifiedBrokers) {
+        if (chosen.length >= 2) break;
+        if (!chosenUrls.has(vb)) {
+          const found = openEntries.find(([u]) => u === vb);
+          if (found) {
+            chosen.push(found);
+            chosenUrls.add(found[0]);
+          }
+        }
+      }
+    }
+
+    // 3. Include Port-443 shiftr.io if open and we still need a 2nd redundant socket
     for (const entry of openEntries) {
+      if (chosen.length >= 2) break;
       const [u] = entry;
       if (!chosenUrls.has(u) && u.includes(':443')) {
         chosen.push(entry);
@@ -564,7 +585,7 @@ class ServerlessMeshTransport implements IntercomTransport {
       }
     }
 
-    // 3. Fill up to 2 sockets for redundancy without flooding all 4 brokers
+    // 4. Fill up to 2 sockets for redundancy without flooding all 4 brokers
     for (const entry of openEntries) {
       if (chosen.length >= 2) break;
       if (!chosenUrls.has(entry[0])) {
@@ -610,31 +631,42 @@ class ServerlessMeshTransport implements IntercomTransport {
       options?.directTargetId || (typeof payload.targetId === 'string' ? payload.targetId : '');
 
     if (options?.isHighRateMedia && targetId) {
-      // High-rate video frames and voice audio chunks use the paced socket outbox on top 2 brokers.
-      // If we haven't received media from partner yet during the first 3.5s of the call, use MESH_TOPIC
-      // so media flows immediately even if a mobile carrier delayed topic #2 subscription.
-      const useMeshTopicFallback =
-        Date.now() - this.callConnectedAt < 3500 &&
-        Date.now() - this.lastPartnerMediaRxAt > 2500;
-      const topic = useMeshTopicFallback ? MESH_TOPIC : getDirectTopic(targetId);
-      const mediaPacket = buildMqttPublishPacket(topic, raw).buffer as ArrayBuffer;
+      // High-rate video frames and voice audio chunks go strictly to the partner's direct topic
+      // on the top 2 verified sockets via the paced outbox—zero self-echo on MESH_TOPIC!
+      const directPacket = buildMqttPublishPacket(getDirectTopic(targetId), raw).buffer as ArrayBuffer;
       const category = options.mediaKind === 'audio' ? 'audio' : 'frame';
       const sockets = this.selectMediaSockets(targetId);
       for (const [url, ws] of sockets) {
-        this.enqueueSocketSend(url, ws, mediaPacket, category);
+        this.enqueueSocketSend(url, ws, directPacket, category);
       }
       return;
     }
 
-    // Send a SINGLE packet per broker socket on MESH_TOPIC (never send both directPacket + roomPacket,
-    // which previously doubled packet bursts and triggered shiftr.io/emqx.io rate limiters!).
-    const roomPacket = buildMqttPublishPacket(MESH_TOPIC, raw).buffer as ArrayBuffer;
     const isPresence = payload._mesh === 'presence';
-    const category = isPresence ? 'presence' : 'urgent';
+    if (isPresence || !targetId) {
+      const roomPacket = buildMqttPublishPacket(MESH_TOPIC, raw).buffer as ArrayBuffer;
+      const category = isPresence ? 'presence' : 'urgent';
+      for (const [url, ws] of this.mqttSockets.entries()) {
+        if (ws.readyState === WebSocket.OPEN && this.mqttConnackSet.has(url)) {
+          this.enqueueSocketSend(url, ws, roomPacket, category);
+        }
+      }
+      return;
+    }
+
+    // Targeted signaling packet (call:invite, call:accept, webrtc:offer, webrtc:answer, webrtc:ice, media:state, chat:msg):
+    // Send on MESH_TOPIC across all active brokers (guaranteed delivery), AND on the partner's direct topic on their verified broker
+    const roomPacket = buildMqttPublishPacket(MESH_TOPIC, raw).buffer as ArrayBuffer;
+    const directPacket = buildMqttPublishPacket(getDirectTopic(targetId), raw).buffer as ArrayBuffer;
+    const peerLastBroker = this.peers.get(targetId)?.lastBrokerUrl;
 
     for (const [url, ws] of this.mqttSockets.entries()) {
       if (ws.readyState === WebSocket.OPEN && this.mqttConnackSet.has(url)) {
-        this.enqueueSocketSend(url, ws, roomPacket, category);
+        if (url === peerLastBroker) {
+          this.enqueueSocketSend(url, ws, directPacket, 'urgent');
+        } else {
+          this.enqueueSocketSend(url, ws, roomPacket, 'urgent');
+        }
       }
     }
   }
@@ -890,6 +922,10 @@ class ServerlessMeshTransport implements IntercomTransport {
       existingPeer.lastSeen = Date.now();
       if (sourceBrokerUrl) {
         existingPeer.lastBrokerUrl = sourceBrokerUrl;
+        if (!existingPeer.verifiedBrokers) {
+          existingPeer.verifiedBrokers = new Set<string>();
+        }
+        existingPeer.verifiedBrokers.add(sourceBrokerUrl);
       }
     }
 
@@ -919,6 +955,11 @@ class ServerlessMeshTransport implements IntercomTransport {
         });
       }
 
+      const verifiedBrokers = existingPeer?.verifiedBrokers || new Set<string>();
+      if (sourceBrokerUrl) {
+        verifiedBrokers.add(sourceBrokerUrl);
+      }
+
       this.peers.set(fromId, {
         clientId: fromId,
         pin: peerPin,
@@ -927,6 +968,7 @@ class ServerlessMeshTransport implements IntercomTransport {
         callId: peerCallId,
         lastSeen: Date.now(),
         lastBrokerUrl: sourceBrokerUrl || existingPeer?.lastBrokerUrl,
+        verifiedBrokers,
       });
 
       // If we are waiting on an outgoing call to this peer and their presence confirms they answered this callId, connect immediately!

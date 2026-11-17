@@ -22,25 +22,15 @@ import { createIntercomTransport, IntercomTransport } from './utils/networkTrans
 
 const RTC_CONFIG: RTCConfiguration = {
   iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun2.l.google.com:19302' },
-    {
-      urls: [
-        'turn:openrelay.metered.ca:80',
-        'turn:openrelay.metered.ca:80?transport=tcp',
-        'turn:openrelay.metered.ca:443',
-        'turn:openrelay.metered.ca:443?transport=tcp',
-        'turns:openrelay.metered.ca:443?transport=tcp',
-      ],
-      username: 'openrelayproject',
-      credential: 'openrelayproject',
-    },
+    { urls: 'stun:stun.sipnet.ru:3478' },
+    { urls: 'stun:stun.sipnet.net:3478' },
+    { urls: 'stun:stun.nextcloud.com:443' },
+    { urls: 'stun:stun.zadarma.com:3478' },
   ],
-  iceCandidatePoolSize: 2,
+  iceCandidatePoolSize: 4,
 };
 
-function waitForIceGatheringBrief(pc: RTCPeerConnection, timeoutMs = 280): Promise<void> {
+function waitForIceGatheringBrief(pc: RTCPeerConnection, timeoutMs = 220): Promise<void> {
   if (pc.iceGatheringState === 'complete') {
     return Promise.resolve();
   }
@@ -187,6 +177,9 @@ export default function App() {
   const peerWebrtcAudioRxRef = useRef<boolean>(false);
   const peerWebrtcVideoRxRef = useRef<boolean>(false);
   const pendingIceCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+  const gatheredLocalCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+  const sdpSentRef = useRef<boolean>(false);
+  const trickleIceSentCountRef = useRef<number>(0);
   const webrtcOfferRetryTimerRef = useRef<number | null>(null);
   const baselinePeerIsPortraitRef = useRef<boolean | null>(null);
 
@@ -577,6 +570,9 @@ export default function App() {
     peerWebrtcVideoRxRef.current = false;
     pcInitPromiseRef.current = null;
     pendingIceCandidatesRef.current = [];
+    gatheredLocalCandidatesRef.current = [];
+    sdpSentRef.current = false;
+    trickleIceSentCountRef.current = 0;
     if (webrtcOfferRetryTimerRef.current !== null) {
       window.clearTimeout(webrtcOfferRetryTimerRef.current);
       webrtcOfferRetryTimerRef.current = null;
@@ -618,10 +614,12 @@ export default function App() {
                 offerToReceiveVideo: true,
               });
               await existingPc.setLocalDescription(offer);
-              await waitForIceGatheringBrief(existingPc, 280);
+              await waitForIceGatheringBrief(existingPc, 220);
+              sdpSentRef.current = true;
               sendWs({
                 type: 'webrtc:offer',
                 sdp: existingPc.localDescription,
+                candidates: [...gatheredLocalCandidatesRef.current],
               });
             } catch {
               // Ignore
@@ -648,9 +646,6 @@ export default function App() {
           const combinedRemote = new MediaStream();
           remoteStreamRef.current = combinedRemote;
 
-          let initialSdpSent = false;
-          let trickleIceSentCount = 0;
-
           const updateConnectedState = () => {
             if (pcRef.current !== pc) return;
             const isConn =
@@ -668,13 +663,25 @@ export default function App() {
 
           pc.onicecandidate = (event) => {
             if (!event.candidate || pcRef.current !== pc) return;
-            // Only trickle late candidates (up to 3 max) that arrive AFTER the bundled SDP was sent,
-            // so we never trigger broker packet-burst rate limiters!
-            if (initialSdpSent && trickleIceSentCount < 3) {
-              trickleIceSentCount++;
+            const jsonCand = event.candidate.toJSON
+              ? event.candidate.toJSON()
+              : {
+                  candidate: event.candidate.candidate,
+                  sdpMid: event.candidate.sdpMid,
+                  sdpMLineIndex: event.candidate.sdpMLineIndex,
+                };
+            if (
+              jsonCand.candidate &&
+              !gatheredLocalCandidatesRef.current.some((c) => c.candidate === jsonCand.candidate)
+            ) {
+              gatheredLocalCandidatesRef.current.push(jsonCand);
+            }
+            // Trickle any late candidates (up to 6 max) that arrive AFTER the bundled Offer or Answer was sent
+            if (sdpSentRef.current && trickleIceSentCountRef.current < 6) {
+              trickleIceSentCountRef.current++;
               sendWs({
                 type: 'webrtc:ice',
-                candidate: event.candidate,
+                candidate: jsonCand,
               });
             }
           };
@@ -738,13 +745,14 @@ export default function App() {
               offerToReceiveVideo: true,
             });
             await pc.setLocalDescription(offer);
-            // Bundle host + STUN ICE candidates directly into the single webrtc:offer packet!
-            await waitForIceGatheringBrief(pc, 280);
-            initialSdpSent = true;
+            // Gather fast host + Russian STUN ICE candidates (~80-220ms) and bundle them into webrtc:offer
+            await waitForIceGatheringBrief(pc, 220);
+            sdpSentRef.current = true;
             if (pcRef.current === pc && pc.localDescription) {
               sendWs({
                 type: 'webrtc:offer',
                 sdp: pc.localDescription,
+                candidates: [...gatheredLocalCandidatesRef.current],
               });
             }
           };
@@ -762,6 +770,7 @@ export default function App() {
                 sendWs({
                   type: 'webrtc:offer',
                   sdp: pc.localDescription,
+                  candidates: [...gatheredLocalCandidatesRef.current],
                 });
                 webrtcOfferRetryTimerRef.current = window.setTimeout(() => {
                   if (
@@ -772,6 +781,7 @@ export default function App() {
                     sendWs({
                       type: 'webrtc:offer',
                       sdp: pc.localDescription,
+                      candidates: [...gatheredLocalCandidatesRef.current],
                     });
                   }
                 }, 1900);
@@ -901,14 +911,14 @@ export default function App() {
       const ctx = capCanvas.getContext('2d');
       if (!ctx) return;
 
-      const maxDim = isServerless ? 216 : 380;
+      const maxDim = isServerless ? 184 : 380;
       const videoEl = localVideoRef.current;
       if (camEnabledRef.current && videoEl && videoEl.readyState >= 2 && videoEl.videoWidth > 0) {
         const vw = videoEl.videoWidth || 480;
         const vh = videoEl.videoHeight || 360;
         const scale = Math.min(1, maxDim / Math.max(vw, vh));
-        const targetW = Math.max(120, Math.round(vw * scale));
-        const targetH = Math.max(90, Math.round(vh * scale));
+        const targetW = Math.max(112, Math.round(vw * scale));
+        const targetH = Math.max(84, Math.round(vh * scale));
         if (capCanvas.width !== targetW || capCanvas.height !== targetH) {
           capCanvas.width = targetW;
           capCanvas.height = targetH;
@@ -931,7 +941,7 @@ export default function App() {
       }
 
       try {
-        const dataUrl = capCanvas.toDataURL('image/jpeg', isServerless ? 0.5 : 0.68);
+        const dataUrl = capCanvas.toDataURL('image/jpeg', isServerless ? 0.44 : 0.68);
         sendWs({
           type: 'media:frame',
           frame: dataUrl,
@@ -991,7 +1001,7 @@ export default function App() {
         silentGain.connect(audioCtx.destination);
 
         let accum: number[] = [];
-        const CHUNK_SAMPLES = 2200; // 220ms at 10kHz -> ~2.9 KB Base64 PCM8 packet (only 4.5 pkt/sec!)
+        const CHUNK_SAMPLES = 1800; // 180ms at 10kHz -> ~2.4 KB Base64 PCM8 packet
 
         const pushInputSamples = (input: Float32Array) => {
           if (!micEnabledRef.current || peerWebrtcAudioRxRef.current) {
@@ -1408,6 +1418,13 @@ export default function App() {
                 window.clearTimeout(webrtcOfferRetryTimerRef.current);
                 webrtcOfferRetryTimerRef.current = null;
               }
+              if (Array.isArray(msg.candidates)) {
+                for (const c of msg.candidates) {
+                  if (c && typeof c.candidate === 'string') {
+                    pendingIceCandidatesRef.current.push(c);
+                  }
+                }
+              }
               let pc = pcRef.current;
               if (!pc || pc.signalingState === 'closed' || pcInitPromiseRef.current) {
                 pc = await startWebRtcSession(false);
@@ -1420,9 +1437,11 @@ export default function App() {
                   pc.remoteDescription.sdp === msg.sdp.sdp &&
                   pc.localDescription
                 ) {
+                  await flushPendingIceCandidates(pc);
                   sendWs({
                     type: 'webrtc:answer',
                     sdp: pc.localDescription,
+                    candidates: [...gatheredLocalCandidatesRef.current],
                   });
                   break;
                 }
@@ -1434,12 +1453,14 @@ export default function App() {
                 await flushPendingIceCandidates(pc);
                 const answer = await pc.createAnswer();
                 await pc.setLocalDescription(answer);
-                // Bundle host + STUN ICE candidates directly into the single webrtc:answer packet!
-                await waitForIceGatheringBrief(pc, 280);
+                // Gather fast host + Russian STUN ICE candidates (~80-220ms) and bundle them into webrtc:answer
+                await waitForIceGatheringBrief(pc, 220);
+                sdpSentRef.current = true;
                 if (pcRef.current === pc && pc.localDescription) {
                   sendWs({
                     type: 'webrtc:answer',
                     sdp: pc.localDescription,
+                    candidates: [...gatheredLocalCandidatesRef.current],
                   });
                 }
               }
@@ -1454,6 +1475,13 @@ export default function App() {
               if (webrtcOfferRetryTimerRef.current !== null) {
                 window.clearTimeout(webrtcOfferRetryTimerRef.current);
                 webrtcOfferRetryTimerRef.current = null;
+              }
+              if (Array.isArray(msg.candidates)) {
+                for (const c of msg.candidates) {
+                  if (c && typeof c.candidate === 'string') {
+                    pendingIceCandidatesRef.current.push(c);
+                  }
+                }
               }
               const pc = pcRef.current;
               if (pc && msg.sdp) {

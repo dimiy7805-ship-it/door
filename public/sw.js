@@ -1,4 +1,4 @@
-const CACHE_NAME = 'domofon-line-pwa-v2';
+const CACHE_NAME = 'domofon-line-pwa-v4';
 const SHELL_ASSETS = [
   './',
   './index.html',
@@ -35,8 +35,14 @@ self.addEventListener('fetch', (event) => {
   if (url.origin !== self.location.origin) return;
   if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/ws')) return;
 
+  const isHtmlNav =
+    request.mode === 'navigate' ||
+    url.pathname.endsWith('/') ||
+    url.pathname.endsWith('.html') ||
+    url.pathname.endsWith('sw.js');
+
   event.respondWith(
-    fetch(request)
+    fetch(request, isHtmlNav ? { cache: 'no-store' } : undefined)
       .then((response) => {
         if (response && response.status === 200 && response.type === 'basic') {
           const clone = response.clone();

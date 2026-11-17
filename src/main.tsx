@@ -17,9 +17,14 @@ createRoot(document.getElementById('root')!).render(<App />);
 
 if (typeof window !== 'undefined' && 'serviceWorker' in navigator) {
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register('./sw.js').catch(() => {
-      // Ignore service worker registration errors in restricted iframe contexts
-    });
+    navigator.serviceWorker
+      .register('./sw.js', { updateViaCache: 'none' })
+      .then((reg) => {
+        reg.update().catch(() => {});
+      })
+      .catch(() => {
+        // Ignore service worker registration errors in restricted iframe contexts
+      });
   });
 }
 
