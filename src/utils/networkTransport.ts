@@ -31,6 +31,22 @@ interface MqttBrokerConfig {
   isPort443?: boolean;
 }
 
+const MESH_RELAY_TAG = 'domofon-liniya-v1-room';
+function getDirectRelayTag(clientId: string): string {
+  return `domofon-liniya-v1-direct-${clientId}`;
+}
+
+/**
+ * Standard Port-443 JSON WebSocket Relays (no 'mqtt' subprotocol, no non-443 ports)
+ * across independent non-Cloudflare (185.18.221.135, 142.132.206.70) and Anycast networks
+ * so Russian mobile carriers (MTS, MegaFon, Beeline, Tele2) and Wi-Fi ISPs always connect.
+ */
+const PORT_443_JSON_RELAYS: string[] = [
+  'wss://relay.snort.social',
+  'wss://nos.lol',
+  'wss://relay.primal.net',
+];
+
 const PUBLIC_MQTT_BROKERS: MqttBrokerConfig[] = [
   // Primary Port-443 broker: bypasses mobile carrier (MTS/MegaFon/Beeline/Tele2) non-443 port blocks
   {
@@ -39,10 +55,217 @@ const PUBLIC_MQTT_BROKERS: MqttBrokerConfig[] = [
     password: 'public',
     isPort443: true,
   },
+  { url: 'wss://mqtt.cetools.org:8081/mqtt' },
   { url: 'wss://broker.emqx.io:8084/mqtt' },
   { url: 'wss://broker.hivemq.com:8884/mqtt' },
   { url: 'wss://test.mosquitto.org:8081/mqtt' },
 ];
+
+// Compact synchronous SHA-256 + precomputed BIP-340 Schnorr signer for Port-443 JSON WebSocket Relays
+const SHA256_K = new Uint32Array([
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+]);
+
+function sha256Bytes(data: Uint8Array): Uint8Array {
+  let h0 = 0x6a09e667,
+    h1 = 0xbb67ae85,
+    h2 = 0x3c6ef372,
+    h3 = 0xa54ff53a;
+  let h4 = 0x510e527f,
+    h5 = 0x9b05688c,
+    h6 = 0x1f83d9ab,
+    h7 = 0x5be0cd19;
+  const len = data.length;
+  const bitLenHi = Math.floor((len * 8) / 0x100000000);
+  const bitLenLo = (len * 8) >>> 0;
+  const paddedLen = (len + 9 + 63) & ~63;
+  const buf = new Uint8Array(paddedLen);
+  buf.set(data);
+  buf[len] = 0x80;
+  const dv = new DataView(buf.buffer);
+  dv.setUint32(paddedLen - 8, bitLenHi, false);
+  dv.setUint32(paddedLen - 4, bitLenLo, false);
+  const w = new Uint32Array(64);
+  for (let off = 0; off < paddedLen; off += 64) {
+    for (let i = 0; i < 16; i++) w[i] = dv.getUint32(off + i * 4, false);
+    for (let i = 16; i < 64; i++) {
+      const v1 = w[i - 15],
+        v2 = w[i - 2];
+      const s0 = ((v1 >>> 7) | (v1 << 25)) ^ ((v1 >>> 18) | (v1 << 14)) ^ (v1 >>> 3);
+      const s1 = ((v2 >>> 17) | (v2 << 15)) ^ ((v2 >>> 19) | (v2 << 13)) ^ (v2 >>> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+    }
+    let a = h0,
+      b = h1,
+      c = h2,
+      d = h3,
+      e = h4,
+      f = h5,
+      g = h6,
+      h = h7;
+    for (let i = 0; i < 64; i++) {
+      const S1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7));
+      const ch = (e & f) ^ (~e & g);
+      const temp1 = (h + S1 + ch + SHA256_K[i] + w[i]) >>> 0;
+      const S0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10));
+      const maj = (a & b) ^ (a & c) ^ (b & c);
+      const temp2 = (S0 + maj) >>> 0;
+      h = g;
+      g = f;
+      f = e;
+      e = (d + temp1) >>> 0;
+      d = c;
+      c = b;
+      b = a;
+      a = (temp1 + temp2) >>> 0;
+    }
+    h0 = (h0 + a) >>> 0;
+    h1 = (h1 + b) >>> 0;
+    h2 = (h2 + c) >>> 0;
+    h3 = (h3 + d) >>> 0;
+    h4 = (h4 + e) >>> 0;
+    h5 = (h5 + f) >>> 0;
+    h6 = (h6 + g) >>> 0;
+    h7 = (h7 + h) >>> 0;
+  }
+  const out = new Uint8Array(32);
+  const odv = new DataView(out.buffer);
+  odv.setUint32(0, h0, false);
+  odv.setUint32(4, h1, false);
+  odv.setUint32(8, h2, false);
+  odv.setUint32(12, h3, false);
+  odv.setUint32(16, h4, false);
+  odv.setUint32(20, h5, false);
+  odv.setUint32(24, h6, false);
+  odv.setUint32(28, h7, false);
+  return out;
+}
+
+const SECP_P = 0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2fn;
+const SECP_N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
+const SECP_GX = 0x79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798n;
+const SECP_GY = 0x483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8n;
+
+function secpMod(a: bigint, m = SECP_P): bigint {
+  const r = a % m;
+  return r >= 0n ? r : r + m;
+}
+function secpPowMod(base: bigint, exp: bigint, m = SECP_P): bigint {
+  let res = 1n,
+    b = secpMod(base, m),
+    e = exp;
+  while (e > 0n) {
+    if (e & 1n) res = (res * b) % m;
+    b = (b * b) % m;
+    e >>= 1n;
+  }
+  return res;
+}
+function secpInvMod(a: bigint, m = SECP_P): bigint {
+  return secpPowMod(a, m - 2n, m);
+}
+function secpPointAdd(p1: [bigint, bigint] | null, p2: [bigint, bigint] | null): [bigint, bigint] | null {
+  if (!p1) return p2;
+  if (!p2) return p1;
+  const [x1, y1] = p1,
+    [x2, y2] = p2;
+  if (x1 === x2 && y1 !== y2) return null;
+  const lam =
+    x1 === x2
+      ? secpMod(3n * x1 * x1 * secpInvMod(2n * y1))
+      : secpMod((y2 - y1) * secpInvMod(x2 - x1));
+  const x3 = secpMod(lam * lam - x1 - x2);
+  return [x3, secpMod(lam * (x1 - x3) - y1)];
+}
+function secpPointMul(k: bigint): [bigint, bigint] {
+  let res: [bigint, bigint] | null = null;
+  let add: [bigint, bigint] | null = [SECP_GX, SECP_GY];
+  let n = k;
+  while (n > 0n) {
+    if (n & 1n) res = secpPointAdd(res, add);
+    add = secpPointAdd(add, add);
+    n >>= 1n;
+  }
+  return res!;
+}
+function bytesToHex(b: Uint8Array): string {
+  let s = '';
+  for (let i = 0; i < b.length; i++) s += b[i].toString(16).padStart(2, '0');
+  return s;
+}
+function hexToBytes(hex: string): Uint8Array {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+function numTo32Hex(n: bigint): string {
+  return n.toString(16).padStart(64, '0');
+}
+
+const BIP340_CHALLENGE_TAG = sha256Bytes(new TextEncoder().encode('BIP0340/challenge'));
+let cachedSchnorrSession: {
+  d: bigint;
+  pubkeyHex: string;
+  k: bigint;
+  rHex: string;
+} | null = null;
+
+function getSchnorrSession() {
+  if (cachedSchnorrSession) return cachedSchnorrSession;
+  const randHex = () =>
+    Array.from({ length: 8 }, () =>
+      Math.floor((Math.random() * 0xffffffff) >>> 0)
+        .toString(16)
+        .padStart(8, '0')
+    ).join('');
+  const d0 = secpMod(BigInt('0x' + randHex()), SECP_N - 1n) + 1n;
+  const [Px, Py] = secpPointMul(d0);
+  const d = (Py & 1n) === 0n ? d0 : SECP_N - d0;
+  const pubkeyHex = numTo32Hex(Px);
+
+  const k0 = secpMod(BigInt('0x' + randHex()), SECP_N - 1n) + 1n;
+  const [Rx, Ry] = secpPointMul(k0);
+  const k = (Ry & 1n) === 0n ? k0 : SECP_N - k0;
+  const rHex = numTo32Hex(Rx);
+
+  cachedSchnorrSession = { d, pubkeyHex, k, rHex };
+  return cachedSchnorrSession;
+}
+
+function buildSignedRelayEventPacket(content: string, tagValue: string): string {
+  const { d, pubkeyHex, k, rHex } = getSchnorrSession();
+  const created_at = Math.floor(Date.now() / 1000);
+  const kind = 24133;
+  const tags = [['t', tagValue]];
+  const ser = JSON.stringify([0, pubkeyHex, created_at, kind, tags, content]);
+  const id = bytesToHex(sha256Bytes(encodeUtf8(ser)));
+  const msgBytes = hexToBytes(rHex + pubkeyHex + id);
+  const chBuf = new Uint8Array(64 + msgBytes.length);
+  chBuf.set(BIP340_CHALLENGE_TAG, 0);
+  chBuf.set(BIP340_CHALLENGE_TAG, 32);
+  chBuf.set(msgBytes, 64);
+  const e = secpMod(BigInt('0x' + bytesToHex(sha256Bytes(chBuf))), SECP_N);
+  const sig = rHex + numTo32Hex(secpMod(k + e * d, SECP_N));
+  return JSON.stringify([
+    'EVENT',
+    {
+      id,
+      pubkey: pubkeyHex,
+      created_at,
+      kind,
+      tags,
+      content,
+      sig,
+    },
+  ]);
+}
 
 function encodeUtf8(str: string): Uint8Array {
   return new TextEncoder().encode(str);
@@ -186,15 +409,15 @@ interface MeshPeerState {
 }
 
 interface SocketOutbox {
-  urgentQueue: ArrayBuffer[];
-  audioQueue: ArrayBuffer[];
-  latestFrame: ArrayBuffer | null;
-  latestPresence: ArrayBuffer | null;
+  urgentQueue: Array<ArrayBuffer | string>;
+  audioQueue: Array<ArrayBuffer | string>;
+  latestFrame: ArrayBuffer | string | null;
+  latestPresence: ArrayBuffer | string | null;
   lastSentAt: number;
   timer: number | null;
 }
 
-const SOCKET_MIN_PACE_MS = 55;
+const SOCKET_MIN_PACE_MS = 45;
 
 /**
  * Serverless P2P / Multi-Broker + Port-443 Mesh Coordinator so the entire 3D Intercom works on
@@ -225,8 +448,10 @@ class ServerlessMeshTransport implements IntercomTransport {
 
   private peers = new Map<string, MeshPeerState>();
   private mqttSockets = new Map<string, WebSocket>();
+  private jsonRelaySockets = new Map<string, WebSocket>();
   private mqttConnackSet = new Set<string>();
   private mqttSubscribedDirect = new Set<string>();
+  private mqttSubPacketId = 1;
   private socketOutboxes = new Map<string, SocketOutbox>();
   private bc: BroadcastChannel | null = null;
   private heartbeatTimer: number | null = null;
@@ -292,6 +517,10 @@ class ServerlessMeshTransport implements IntercomTransport {
       return;
     }
 
+    for (const relayUrl of PORT_443_JSON_RELAYS) {
+      this.connectSingleJsonRelay(relayUrl);
+    }
+
     for (const broker of PUBLIC_MQTT_BROKERS) {
       this.connectSingleMqttBroker(broker);
     }
@@ -315,7 +544,7 @@ class ServerlessMeshTransport implements IntercomTransport {
 
   private drainSocketOutbox(url: string) {
     const box = this.socketOutboxes.get(url);
-    const ws = this.mqttSockets.get(url);
+    const ws = this.mqttSockets.get(url) || this.jsonRelaySockets.get(url);
     if (!box || !ws || ws.readyState !== WebSocket.OPEN) {
       if (box && box.timer !== null) {
         window.clearTimeout(box.timer);
@@ -336,7 +565,7 @@ class ServerlessMeshTransport implements IntercomTransport {
       return;
     }
 
-    let nextPacket: ArrayBuffer | null = null;
+    let nextPacket: ArrayBuffer | string | null = null;
     if (box.urgentQueue.length > 0) {
       nextPacket = box.urgentQueue.shift()!;
     } else if (box.audioQueue.length > 0) {
@@ -375,7 +604,7 @@ class ServerlessMeshTransport implements IntercomTransport {
   private enqueueSocketSend(
     url: string,
     ws: WebSocket,
-    packet: ArrayBuffer,
+    packet: ArrayBuffer | string,
     category: 'urgent' | 'audio' | 'frame' | 'presence'
   ) {
     if (ws.readyState !== WebSocket.OPEN) return;
@@ -383,12 +612,12 @@ class ServerlessMeshTransport implements IntercomTransport {
 
     if (category === 'urgent') {
       box.urgentQueue.push(packet);
-      if (box.urgentQueue.length > 20) {
+      if (box.urgentQueue.length > 24) {
         box.urgentQueue.shift();
       }
     } else if (category === 'audio') {
       box.audioQueue.push(packet);
-      // Keep audio real-time: cap buffered audio chunks at 4 (~750ms max)
+      // Keep audio real-time: cap buffered audio chunks at 4 (~720ms max)
       while (box.audioQueue.length > 4) {
         box.audioQueue.shift();
       }
@@ -402,6 +631,90 @@ class ServerlessMeshTransport implements IntercomTransport {
     this.drainSocketOutbox(url);
   }
 
+  private subscribeJsonRelayOnSocket(ws: WebSocket) {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    try {
+      const tags = this.clientId
+        ? [MESH_RELAY_TAG, getDirectRelayTag(this.clientId)]
+        : [MESH_RELAY_TAG];
+      ws.send(
+        JSON.stringify([
+          'REQ',
+          'dl_mesh_sub',
+          {
+            kinds: [24133],
+            '#t': tags,
+          },
+        ])
+      );
+    } catch {
+      // Ignore
+    }
+  }
+
+  private connectSingleJsonRelay(url: string) {
+    if (this.closed) return;
+    const existing = this.jsonRelaySockets.get(url);
+    if (
+      existing &&
+      (existing.readyState === WebSocket.OPEN || existing.readyState === WebSocket.CONNECTING)
+    ) {
+      return;
+    }
+
+    try {
+      const ws = new WebSocket(url);
+      this.jsonRelaySockets.set(url, ws);
+
+      ws.onopen = () => {
+        if (this.closed) return;
+        this.subscribeJsonRelayOnSocket(ws);
+        window.setTimeout(() => {
+          if (!this.closed && this.jsonRelaySockets.get(url) === ws) {
+            this.broadcastPresencePacket();
+          }
+        }, 90);
+      };
+
+      ws.onmessage = (ev) => {
+        if (typeof ev.data !== 'string') return;
+        try {
+          const arr = JSON.parse(ev.data);
+          if (
+            Array.isArray(arr) &&
+            arr[0] === 'EVENT' &&
+            arr[2] &&
+            typeof arr[2].content === 'string'
+          ) {
+            this.handleWirePacket(arr[2].content, url);
+          }
+        } catch {
+          // Ignore non-JSON or malformed relay messages
+        }
+      };
+
+      ws.onerror = () => {
+        // Handled in onclose
+      };
+
+      ws.onclose = () => {
+        if (this.jsonRelaySockets.get(url) === ws) {
+          this.jsonRelaySockets.delete(url);
+        }
+        const box = this.socketOutboxes.get(url);
+        if (box && box.timer !== null) {
+          window.clearTimeout(box.timer);
+          box.timer = null;
+        }
+        this.socketOutboxes.delete(url);
+        if (this.closed) return;
+        window.setTimeout(() => this.connectSingleJsonRelay(url), 3200);
+      };
+    } catch {
+      // Ignore individual relay failure
+    }
+  }
+
   private subscribeClientDirectOnSocket(url: string, ws: WebSocket) {
     if (ws.readyState !== WebSocket.OPEN || !this.mqttConnackSet.has(url)) {
       return;
@@ -411,7 +724,8 @@ class ServerlessMeshTransport implements IntercomTransport {
     this.mqttSubscribedDirect.add(key);
     try {
       const topics = this.clientId ? [MESH_TOPIC, getDirectTopic(this.clientId)] : [MESH_TOPIC];
-      ws.send(buildMqttMultiSubscribePacket(topics, 1).buffer as ArrayBuffer);
+      this.mqttSubPacketId = (this.mqttSubPacketId % 60000) + 1;
+      ws.send(buildMqttMultiSubscribePacket(topics, this.mqttSubPacketId).buffer as ArrayBuffer);
     } catch {
       // Ignore
     }
@@ -421,6 +735,9 @@ class ServerlessMeshTransport implements IntercomTransport {
     if (!this.clientId) return;
     for (const [url, ws] of this.mqttSockets.entries()) {
       this.subscribeClientDirectOnSocket(url, ws);
+    }
+    for (const ws of this.jsonRelaySockets.values()) {
+      this.subscribeJsonRelayOnSocket(ws);
     }
   }
 
@@ -475,8 +792,14 @@ class ServerlessMeshTransport implements IntercomTransport {
       };
 
       ws.onmessage = (ev) => {
-        if (!(ev.data instanceof ArrayBuffer)) return;
-        const chunk = new Uint8Array(ev.data);
+        const rawData = ev.data;
+        let chunk: Uint8Array | null = null;
+        if (rawData instanceof ArrayBuffer) {
+          chunk = new Uint8Array(rawData);
+        } else if (ArrayBuffer.isView(rawData)) {
+          chunk = new Uint8Array(rawData.buffer, rawData.byteOffset, rawData.byteLength);
+        }
+        if (!chunk) return;
         if (chunk.length >= 2 && chunk[0] >> 4 === 2) {
           // Authentic MQTT CONNACK received: send atomic multi-topic SUBSCRIBE now that session is active
           sendSubscriptionsAfterConnack();
@@ -530,67 +853,77 @@ class ServerlessMeshTransport implements IntercomTransport {
         }
       }
     }
+    for (const ws of this.jsonRelaySockets.values()) {
+      if (ws.readyState === WebSocket.OPEN) {
+        this.subscribeJsonRelayOnSocket(ws);
+      }
+    }
   }
 
-  private selectMediaSockets(targetId?: string): Array<[string, WebSocket]> {
-    const openEntries: Array<[string, WebSocket]> = [];
+  private selectMediaSockets(
+    targetId?: string
+  ): Array<{ url: string; ws: WebSocket; isJsonRelay: boolean }> {
+    const openEntries: Array<{ url: string; ws: WebSocket; isJsonRelay: boolean }> = [];
+    for (const [url, ws] of this.jsonRelaySockets.entries()) {
+      if (ws.readyState === WebSocket.OPEN && ws.bufferedAmount < 64000) {
+        openEntries.push({ url, ws, isJsonRelay: true });
+      }
+    }
     for (const [url, ws] of this.mqttSockets.entries()) {
       if (
         ws.readyState === WebSocket.OPEN &&
         this.mqttConnackSet.has(url) &&
         ws.bufferedAmount < 64000
       ) {
-        openEntries.push([url, ws]);
+        openEntries.push({ url, ws, isJsonRelay: false });
       }
     }
     if (openEntries.length <= 2) {
       return openEntries;
     }
 
-    const chosen: Array<[string, WebSocket]> = [];
+    const chosen: Array<{ url: string; ws: WebSocket; isJsonRelay: boolean }> = [];
     const chosenUrls = new Set<string>();
     const peer = targetId ? this.peers.get(targetId) : undefined;
 
-    // 1. Prefer the broker over which we most recently heard from this peer
+    // 1. Prefer the broker/relay over which we most recently heard from this peer
     if (peer?.lastBrokerUrl) {
-      const found = openEntries.find(([u]) => u === peer.lastBrokerUrl);
+      const found = openEntries.find((e) => e.url === peer.lastBrokerUrl);
       if (found) {
         chosen.push(found);
-        chosenUrls.add(found[0]);
+        chosenUrls.add(found.url);
       }
     }
 
-    // 2. Include any other verified broker from which we have received packets from this peer
+    // 2. Include any other verified broker/relay from which we have received packets from this peer
     if (peer?.verifiedBrokers) {
       for (const vb of peer.verifiedBrokers) {
         if (chosen.length >= 2) break;
         if (!chosenUrls.has(vb)) {
-          const found = openEntries.find(([u]) => u === vb);
+          const found = openEntries.find((e) => e.url === vb);
           if (found) {
             chosen.push(found);
-            chosenUrls.add(found[0]);
+            chosenUrls.add(found.url);
           }
         }
       }
     }
 
-    // 3. Include Port-443 shiftr.io if open and we still need a 2nd redundant socket
+    // 3. Include a Port-443 socket (JSON relay or shiftr:443) if we still need a 2nd redundant socket
     for (const entry of openEntries) {
       if (chosen.length >= 2) break;
-      const [u] = entry;
-      if (!chosenUrls.has(u) && u.includes(':443')) {
+      if (!chosenUrls.has(entry.url) && (entry.isJsonRelay || entry.url.includes(':443'))) {
         chosen.push(entry);
-        chosenUrls.add(u);
-        break;
+        chosenUrls.add(entry.url);
       }
     }
 
-    // 4. Fill up to 2 sockets for redundancy without flooding all 4 brokers
+    // 4. Fill up to 2 sockets for redundancy
     for (const entry of openEntries) {
       if (chosen.length >= 2) break;
-      if (!chosenUrls.has(entry[0])) {
+      if (!chosenUrls.has(entry.url)) {
         chosen.push(entry);
-        chosenUrls.add(entry[0]);
+        chosenUrls.add(entry.url);
       }
     }
 
@@ -631,41 +964,75 @@ class ServerlessMeshTransport implements IntercomTransport {
       options?.directTargetId || (typeof payload.targetId === 'string' ? payload.targetId : '');
 
     if (options?.isHighRateMedia && targetId) {
-      // High-rate video frames and voice audio chunks go strictly to the partner's direct topic
+      // High-rate video frames and voice audio chunks go strictly to the partner's direct topic/tag
       // on the top 2 verified sockets via the paced outbox—zero self-echo on MESH_TOPIC!
-      const directPacket = buildMqttPublishPacket(getDirectTopic(targetId), raw).buffer as ArrayBuffer;
       const category = options.mediaKind === 'audio' ? 'audio' : 'frame';
       const sockets = this.selectMediaSockets(targetId);
-      for (const [url, ws] of sockets) {
-        this.enqueueSocketSend(url, ws, directPacket, category);
-      }
-      return;
-    }
+      let mqttDirectPacket: ArrayBuffer | null = null;
+      let jsonRelayDirectPacket: string | null = null;
 
-    const isPresence = payload._mesh === 'presence';
-    if (isPresence || !targetId) {
-      const roomPacket = buildMqttPublishPacket(MESH_TOPIC, raw).buffer as ArrayBuffer;
-      const category = isPresence ? 'presence' : 'urgent';
-      for (const [url, ws] of this.mqttSockets.entries()) {
-        if (ws.readyState === WebSocket.OPEN && this.mqttConnackSet.has(url)) {
-          this.enqueueSocketSend(url, ws, roomPacket, category);
+      for (const { url, ws, isJsonRelay } of sockets) {
+        if (isJsonRelay) {
+          if (!jsonRelayDirectPacket) {
+            jsonRelayDirectPacket = buildSignedRelayEventPacket(raw, getDirectRelayTag(targetId));
+          }
+          this.enqueueSocketSend(url, ws, jsonRelayDirectPacket, category);
+        } else {
+          if (!mqttDirectPacket) {
+            mqttDirectPacket = buildMqttPublishPacket(getDirectTopic(targetId), raw)
+              .buffer as ArrayBuffer;
+          }
+          this.enqueueSocketSend(url, ws, mqttDirectPacket, category);
         }
       }
       return;
     }
 
-    // Targeted signaling packet (call:invite, call:accept, webrtc:offer, webrtc:answer, webrtc:ice, media:state, chat:msg):
-    // Send on MESH_TOPIC across all active brokers (guaranteed delivery), AND on the partner's direct topic on their verified broker
-    const roomPacket = buildMqttPublishPacket(MESH_TOPIC, raw).buffer as ArrayBuffer;
-    const directPacket = buildMqttPublishPacket(getDirectTopic(targetId), raw).buffer as ArrayBuffer;
-    const peerLastBroker = this.peers.get(targetId)?.lastBrokerUrl;
+    const isPresence = payload._mesh === 'presence';
+    const category = isPresence ? 'presence' : 'urgent';
+    const mqttRoomPacket = buildMqttPublishPacket(MESH_TOPIC, raw).buffer as ArrayBuffer;
+    const jsonRoomPacket = buildSignedRelayEventPacket(raw, MESH_RELAY_TAG);
 
+    // 1. Send room packet across all active MQTT brokers and Port-443 JSON WebSocket Relays
     for (const [url, ws] of this.mqttSockets.entries()) {
       if (ws.readyState === WebSocket.OPEN && this.mqttConnackSet.has(url)) {
-        if (url === peerLastBroker) {
-          this.enqueueSocketSend(url, ws, directPacket, 'urgent');
-        } else {
-          this.enqueueSocketSend(url, ws, roomPacket, 'urgent');
+        this.enqueueSocketSend(url, ws, mqttRoomPacket, category);
+      }
+    }
+    for (const [url, ws] of this.jsonRelaySockets.entries()) {
+      if (ws.readyState === WebSocket.OPEN) {
+        this.enqueueSocketSend(url, ws, jsonRoomPacket, category);
+      }
+    }
+
+    // 2. If this is a targeted signaling packet (call:invite, call:accept, webrtc:offer, webrtc:answer, webrtc:ice, chat:msg),
+    // ALSO send on the partner's direct topic/tag on their verified broker/relay for redundant direct delivery!
+    if (!isPresence && targetId) {
+      const peer = this.peers.get(targetId);
+      const verifiedUrls = new Set<string>();
+      if (peer?.lastBrokerUrl) verifiedUrls.add(peer.lastBrokerUrl);
+      if (peer?.verifiedBrokers) {
+        for (const vb of peer.verifiedBrokers) verifiedUrls.add(vb);
+      }
+      if (verifiedUrls.size > 0) {
+        let mqttDirectPacket: ArrayBuffer | null = null;
+        let jsonDirectPacket: string | null = null;
+        for (const vUrl of verifiedUrls) {
+          const mWs = this.mqttSockets.get(vUrl);
+          if (mWs && mWs.readyState === WebSocket.OPEN && this.mqttConnackSet.has(vUrl)) {
+            if (!mqttDirectPacket) {
+              mqttDirectPacket = buildMqttPublishPacket(getDirectTopic(targetId), raw)
+                .buffer as ArrayBuffer;
+            }
+            this.enqueueSocketSend(vUrl, mWs, mqttDirectPacket, 'urgent');
+          }
+          const rWs = this.jsonRelaySockets.get(vUrl);
+          if (rWs && rWs.readyState === WebSocket.OPEN) {
+            if (!jsonDirectPacket) {
+              jsonDirectPacket = buildSignedRelayEventPacket(raw, getDirectRelayTag(targetId));
+            }
+            this.enqueueSocketSend(vUrl, rWs, jsonDirectPacket, 'urgent');
+          }
         }
       }
     }
@@ -1556,6 +1923,7 @@ class ServerlessMeshTransport implements IntercomTransport {
       type === 'webrtc:offer' ||
       type === 'webrtc:answer' ||
       type === 'webrtc:ice' ||
+      type === 'webrtc:need_offer' ||
       type === 'media:frame' ||
       type === 'media:audio' ||
       type === 'media:state' ||
@@ -1583,7 +1951,7 @@ class ServerlessMeshTransport implements IntercomTransport {
 
       if (type === 'media:frame') {
         const now = Date.now();
-        if (now - this.lastFrameRelayAt < 175) {
+        if (now - this.lastFrameRelayAt < 140) {
           return;
         }
         this.lastFrameRelayAt = now;
@@ -1658,6 +2026,14 @@ class ServerlessMeshTransport implements IntercomTransport {
     this.mqttSockets.clear();
     this.mqttConnackSet.clear();
     this.mqttSubscribedDirect.clear();
+    for (const ws of this.jsonRelaySockets.values()) {
+      try {
+        ws.close();
+      } catch {
+        // Ignore
+      }
+    }
+    this.jsonRelaySockets.clear();
     try {
       this.bc?.close();
     } catch {

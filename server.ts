@@ -871,6 +871,7 @@ async function startServer() {
         type === 'webrtc:offer' ||
         type === 'webrtc:answer' ||
         type === 'webrtc:ice' ||
+        type === 'webrtc:need_offer' ||
         type === 'media:frame' ||
         type === 'media:audio' ||
         type === 'media:state' ||

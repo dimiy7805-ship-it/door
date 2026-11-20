@@ -68,21 +68,89 @@
   </head>
   <body class="bg-[#0c0d0e] text-[#e4e5e7] antialiased selection:bg-zinc-700 selection:text-white overflow-hidden">
     <div id="root">
-      <main style="max-width: 780px; margin: 40px auto; padding: 24px; font-family: system-ui, -apple-system, sans-serif; color: #e4e5e7;">
+      <div
+        style="
+          position: fixed;
+          inset: 0;
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          justify-content: center;
+          background: #0c0d0e;
+          color: #e4e5e7;
+          font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+          user-select: none;
+          z-index: 9999;
+        "
+      >
+        <style>
+          @keyframes domofonPulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.35; transform: scale(0.92); }
+          }
+          @keyframes domofonScan {
+            0% { transform: translateX(-100%); }
+            100% { transform: translateX(220%); }
+          }
+        </style>
+        <div
+          style="
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px 18px;
+            border-radius: 10px;
+            background: #121417;
+            border: 1px solid rgba(255, 255, 255, 0.07);
+            box-shadow: 0 12px 32px rgba(0, 0, 0, 0.6);
+          "
+        >
+          <span
+            style="
+              width: 8px;
+              height: 8px;
+              border-radius: 9999px;
+              background: #ef4444;
+              box-shadow: 0 0 10px #ef4444;
+              animation: domofonPulse 1.4s ease-in-out infinite;
+            "
+          ></span>
+          <span style="font-size: 13px; font-weight: 700; letter-spacing: 0.14em; color: #d4d7dd;">
+            ДОМОФОН.ЛИНИЯ
+          </span>
+        </div>
+        <div
+          style="
+            margin-top: 14px;
+            width: 148px;
+            height: 2px;
+            border-radius: 9999px;
+            background: rgba(255, 255, 255, 0.08);
+            overflow: hidden;
+            position: relative;
+          "
+        >
+          <div
+            style="
+              width: 45%;
+              height: 100%;
+              border-radius: 9999px;
+              background: linear-gradient(90deg, transparent, #ef4444, #f97316, transparent);
+              animation: domofonScan 1.15s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+            "
+          ></div>
+        </div>
+      </div>
+    </div>
+    <noscript>
+      <main>
         <h1>Домофон Линия (Domofon Liniya) — 3D Видеодомофон и Рулетка</h1>
         <p>
-          <strong>Домофон.Линия</strong> — интерактивный онлайн-симулятор отечественных подъездных видеодомофонов
-          <strong>ELTIS DP400</strong>, <strong>VIZIT BVD-343</strong> и <strong>CYFRAL CCD-2094</strong> с реальной
-          видеосвязью, звуком и чатом прямо в браузере на ПК и смартфонах.
+          Домофон.Линия — интерактивный онлайн-симулятор подъездных видеодомофонов ELTIS DP400, VIZIT BVD-343 и CYFRAL
+          CCD-2094 с видеосвязью, звуком и чатом в браузере.
         </p>
-        <h2>Основные возможности</h2>
-        <ul>
-          <li>Прямые видеозвонки по короткому номеру (коду квартиры от 1 до 5 цифр) между устройствами по Wi‑Fi и мобильной сети.</li>
-          <li>Режим «Домофон-Рулетка» — мгновенное соединение со случайным собеседником онлайн с автоматическим набором номера на 3D-панели.</li>
-          <li>Реалистичные 3D-корпуса ELTIS, VIZIT и CYFRAL с живым монитором, матричной клавиатурой, подсветкой и фирменными звуковыми сигналами.</li>
-        </ul>
       </main>
-    </div>
+    </noscript>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
