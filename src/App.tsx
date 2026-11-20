@@ -154,6 +154,7 @@ export default function App() {
   );
   const [remoteFrameSeq, setRemoteFrameSeq] = useState<number>(0);
   const [isHardwareCam, setIsHardwareCam] = useState<boolean>(false);
+  const [isSceneReady, setIsSceneReady] = useState<boolean>(false);
 
   const wsRef = useRef<IntercomTransport | null>(null);
   const pcRef = useRef<RTCPeerConnection | null>(null);
@@ -341,8 +342,9 @@ export default function App() {
               },
               audio: {
                 echoCancellation: true,
-                noiseSuppression: true,
+                noiseSuppression: false,
                 autoGainControl: true,
+                sampleRate: { ideal: 48000 },
               },
             });
             if (combined.getVideoTracks()[0]) {
@@ -375,8 +377,9 @@ export default function App() {
                   const audioOnly = await navigator.mediaDevices.getUserMedia({
                     audio: {
                       echoCancellation: true,
-                      noiseSuppression: true,
+                      noiseSuppression: false,
                       autoGainControl: true,
+                      sampleRate: { ideal: 48000 },
                     },
                     video: false,
                   });
@@ -1015,7 +1018,7 @@ export default function App() {
           audioCtx.resume().catch(() => {});
         }
         const inRate = audioCtx.sampleRate || 48000;
-        const targetRate = 10000;
+        const targetRate = 12000;
         const step = Math.max(1, inRate / targetRate);
         const outRate = Math.round(inRate / step);
 
@@ -1025,7 +1028,7 @@ export default function App() {
         silentGain.connect(audioCtx.destination);
 
         let accum: number[] = [];
-        const CHUNK_SAMPLES = 1800; // 180ms at 10kHz -> ~2.4 KB Base64 PCM8 packet
+        const CHUNK_SAMPLES = 2000; // ~166ms at 12kHz -> smooth continuous voice + ambient audio
 
         const pushInputSamples = (input: Float32Array) => {
           if (
@@ -1045,22 +1048,16 @@ export default function App() {
             for (let k = startIdx; k < endIdx; k++) {
               sum += input[k];
             }
-            accum.push(sum / Math.max(1, endIdx - startIdx));
+            // Apply 1.65x mic pre-boost before companding so quiet speech and room rustle/breath are never clipped or gated out
+            accum.push((sum / Math.max(1, endIdx - startIdx)) * 1.65);
           }
           while (accum.length >= CHUNK_SAMPLES) {
             const slice = accum.splice(0, CHUNK_SAMPLES);
-            let peak = 0;
-            for (let j = 0; j < slice.length; j += 4) {
-              const a = Math.abs(slice[j]);
-              if (a > peak) peak = a;
-            }
-            if (peak >= 0.0035) {
-              sendWs({
-                type: 'media:audio',
-                pcm8: encodePcm8Base64(slice),
-                rate: outRate,
-              });
-            }
+            sendWs({
+              type: 'media:audio',
+              pcm8: encodePcm8Base64(slice),
+              rate: outRate,
+            });
           }
         };
 
@@ -1804,6 +1801,11 @@ export default function App() {
     clearAutoDialTimers();
     resetCallChat();
     closePeerConnection();
+    try {
+      sessionStorage.removeItem('intercom_last_peer_frame');
+    } catch {
+      // Ignore
+    }
     sendWs({ type: 'roulette:stop' });
     setCallState('idle');
     setPeerPin(null);
@@ -1822,6 +1824,11 @@ export default function App() {
     clearAutoDialTimers();
     resetCallChat();
     closePeerConnection();
+    try {
+      sessionStorage.removeItem('intercom_last_peer_frame');
+    } catch {
+      // Ignore
+    }
     if (modeRef.current === 'roulette') {
       sendWs({ type: 'roulette:stop' });
     } else {
@@ -2093,6 +2100,24 @@ export default function App() {
         }}
       />
 
+      {/* Full-viewport hardware boot loader that remains visible until the 3D intercom panel itself renders its first frame */}
+      <div
+        className={`fixed inset-0 z-50 flex flex-col items-center justify-center bg-[#0c0d0e] transition-opacity duration-300 ${
+          isSceneReady ? 'opacity-0 pointer-events-none' : 'opacity-100'
+        }`}
+        aria-hidden={isSceneReady}
+      >
+        <div className="flex items-center gap-2.5 px-4.5 py-2.5 rounded-[10px] bg-[#121417] border border-white/[0.07] shadow-[0_12px_32px_rgba(0,0,0,0.6)]">
+          <span className="w-2 h-2 rounded-full bg-red-500 shadow-[0_0_10px_#ef4444] animate-pulse" />
+          <span className="font-mono text-[13px] font-bold tracking-[0.14em] text-[#d4d7dd]">
+            ДОМОФОН.ЛИНИЯ
+          </span>
+        </div>
+        <div className="mt-3.5 w-[148px] h-[2px] rounded-full bg-white/[0.08] overflow-hidden relative">
+          <div className="w-1/2 h-full rounded-full bg-gradient-to-r from-transparent via-red-500 to-transparent animate-pulse" />
+        </div>
+      </div>
+
       {/* Fullscreen 3D Intercom Viewport */}
       <main className="w-full h-full pt-11">
         <IntercomScene3D
@@ -2118,6 +2143,7 @@ export default function App() {
           baselinePeerIsPortrait={baselinePeerIsPortrait}
           onRotateRemoteVideo={handleRotateRemoteVideo}
           isNightMode={isNightMode}
+          onSceneReady={() => setIsSceneReady(true)}
         />
       </main>
 

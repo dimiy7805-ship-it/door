@@ -637,6 +637,7 @@ class ServerlessMeshTransport implements IntercomTransport {
       const tags = this.clientId
         ? [MESH_RELAY_TAG, getDirectRelayTag(this.clientId)]
         : [MESH_RELAY_TAG];
+      const sinceSec = Math.floor(Date.now() / 1000);
       ws.send(
         JSON.stringify([
           'REQ',
@@ -644,6 +645,8 @@ class ServerlessMeshTransport implements IntercomTransport {
           {
             kinds: [24133],
             '#t': tags,
+            since: sinceSec,
+            limit: 0,
           },
         ])
       );
@@ -864,11 +867,7 @@ class ServerlessMeshTransport implements IntercomTransport {
     targetId?: string
   ): Array<{ url: string; ws: WebSocket; isJsonRelay: boolean }> {
     const openEntries: Array<{ url: string; ws: WebSocket; isJsonRelay: boolean }> = [];
-    for (const [url, ws] of this.jsonRelaySockets.entries()) {
-      if (ws.readyState === WebSocket.OPEN && ws.bufferedAmount < 64000) {
-        openEntries.push({ url, ws, isJsonRelay: true });
-      }
-    }
+    // Put binary MQTT brokers first so same-Wi-Fi or open-MQTT networks use ultra-fast binary MQTT instead of rate-limited JSON relays
     for (const [url, ws] of this.mqttSockets.entries()) {
       if (
         ws.readyState === WebSocket.OPEN &&
@@ -876,6 +875,11 @@ class ServerlessMeshTransport implements IntercomTransport {
         ws.bufferedAmount < 64000
       ) {
         openEntries.push({ url, ws, isJsonRelay: false });
+      }
+    }
+    for (const [url, ws] of this.jsonRelaySockets.entries()) {
+      if (ws.readyState === WebSocket.OPEN && ws.bufferedAmount < 64000) {
+        openEntries.push({ url, ws, isJsonRelay: true });
       }
     }
     if (openEntries.length <= 2) {
@@ -886,8 +890,20 @@ class ServerlessMeshTransport implements IntercomTransport {
     const chosenUrls = new Set<string>();
     const peer = targetId ? this.peers.get(targetId) : undefined;
 
-    // 1. Prefer the broker/relay over which we most recently heard from this peer
-    if (peer?.lastBrokerUrl) {
+    // 1. Prefer verified binary MQTT brokers from which we have received packets from this peer (lowest latency & zero event-rate throttling)
+    if (peer?.verifiedBrokers) {
+      for (const vb of peer.verifiedBrokers) {
+        if (chosen.length >= 2) break;
+        const found = openEntries.find((e) => e.url === vb && !e.isJsonRelay);
+        if (found && !chosenUrls.has(found.url)) {
+          chosen.push(found);
+          chosenUrls.add(found.url);
+        }
+      }
+    }
+
+    // 2. Prefer the broker/relay over which we most recently heard from this peer
+    if (peer?.lastBrokerUrl && chosen.length < 2 && !chosenUrls.has(peer.lastBrokerUrl)) {
       const found = openEntries.find((e) => e.url === peer.lastBrokerUrl);
       if (found) {
         chosen.push(found);
@@ -895,7 +911,7 @@ class ServerlessMeshTransport implements IntercomTransport {
       }
     }
 
-    // 2. Include any other verified broker/relay from which we have received packets from this peer
+    // 3. Include any other verified broker/relay from which we have received packets from this peer
     if (peer?.verifiedBrokers) {
       for (const vb of peer.verifiedBrokers) {
         if (chosen.length >= 2) break;
@@ -909,7 +925,7 @@ class ServerlessMeshTransport implements IntercomTransport {
       }
     }
 
-    // 3. Include a Port-443 socket (JSON relay or shiftr:443) if we still need a 2nd redundant socket
+    // 4. Include a Port-443 socket (JSON relay or shiftr:443) if we still need a 2nd redundant socket
     for (const entry of openEntries) {
       if (chosen.length >= 2) break;
       if (!chosenUrls.has(entry.url) && (entry.isJsonRelay || entry.url.includes(':443'))) {
@@ -918,7 +934,7 @@ class ServerlessMeshTransport implements IntercomTransport {
       }
     }
 
-    // 4. Fill up to 2 sockets for redundancy
+    // 5. Fill up to 2 sockets for redundancy
     for (const entry of openEntries) {
       if (chosen.length >= 2) break;
       if (!chosenUrls.has(entry.url)) {
@@ -1284,6 +1300,17 @@ class ServerlessMeshTransport implements IntercomTransport {
     const fromId = String(pkt._fromId || '');
     if (!fromId || fromId === this.clientId) return;
 
+    const meshType = String(pkt._mesh || '');
+    const pktTs = Number(pkt._ts || 0);
+    if (pktTs > 0) {
+      const ageMs = Date.now() - pktTs;
+      // Discard stale historical packets cached by JSON relays so page reload never triggers a phantom incoming call or stale audio/video!
+      const maxAllowedAgeMs = meshType === 'presence' ? 40000 : 12000;
+      if (ageMs > maxAllowedAgeMs) {
+        return;
+      }
+    }
+
     const existingPeer = this.peers.get(fromId);
     if (existingPeer) {
       existingPeer.lastSeen = Date.now();
@@ -1295,8 +1322,6 @@ class ServerlessMeshTransport implements IntercomTransport {
         existingPeer.verifiedBrokers.add(sourceBrokerUrl);
       }
     }
-
-    const meshType = String(pkt._mesh || '');
 
     if (meshType === 'presence') {
       const peerPin = String(pkt.pin || '');
@@ -1524,6 +1549,10 @@ class ServerlessMeshTransport implements IntercomTransport {
     }
 
     if (meshType === 'relay') {
+      // Only accept WebRTC / media / chat relay packets from our current active call partner!
+      if (!this.callId || this.partnerClientId !== fromId) {
+        return;
+      }
       const inner = pkt.payload;
       if (inner && typeof inner === 'object') {
         // If we were still ringing on an outgoing call to this partner and start receiving WebRTC/media relay packets from them,

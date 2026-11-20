@@ -33,6 +33,7 @@ export interface IntercomScene3DProps {
   baselinePeerIsPortrait?: boolean | null;
   onRotateRemoteVideo?: () => void;
   isNightMode?: boolean;
+  onSceneReady?: () => void;
 }
 
 const KEY_LABELS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', 'C', '0', 'B'];
@@ -950,6 +951,7 @@ export const IntercomScene3D: React.FC<IntercomScene3DProps> = ({
   baselinePeerIsPortrait = null,
   onRotateRemoteVideo,
   isNightMode = false,
+  onSceneReady,
 }) => {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const onKeyPressRef = useRef(onKeyPress);
@@ -958,6 +960,9 @@ export const IntercomScene3D: React.FC<IntercomScene3DProps> = ({
   onToggleSelfPreviewRef.current = onToggleSelfPreview;
   const onRotateRemoteVideoRef = useRef(onRotateRemoteVideo);
   onRotateRemoteVideoRef.current = onRotateRemoteVideo;
+  const onSceneReadyRef = useRef(onSceneReady);
+  onSceneReadyRef.current = onSceneReady;
+  const hasNotifiedReadyRef = useRef(false);
 
   // Draggable PiP coordinates inside the 512x320 embedded intercom screen
   const pipStateRef = useRef({
@@ -2591,6 +2596,10 @@ export const IntercomScene3D: React.FC<IntercomScene3DProps> = ({
           renderSoftwareScene();
         } else if (renderer) {
           renderer.render(scene, camera);
+        }
+        if (!hasNotifiedReadyRef.current) {
+          hasNotifiedReadyRef.current = true;
+          onSceneReadyRef.current?.();
         }
         renderBusy = false;
         if (renderDirty || buttonsMoving || camMoved) {

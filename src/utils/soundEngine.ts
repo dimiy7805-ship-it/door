@@ -231,10 +231,10 @@ class IntercomSoundEngine {
 
       const filterNode = ctx.createBiquadFilter();
       filterNode.type = 'lowpass';
-      filterNode.frequency.value = Math.min(4100, safeRate * 0.44);
+      filterNode.frequency.value = Math.min(5400, safeRate * 0.48);
 
       const gainNode = ctx.createGain();
-      gainNode.gain.value = 1.45;
+      gainNode.gain.value = 2.15;
 
       source.connect(filterNode);
       filterNode.connect(gainNode);
