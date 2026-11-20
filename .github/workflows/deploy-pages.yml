@@ -15,10 +15,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-and-deploy:
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+  build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -37,6 +34,7 @@ jobs:
           GITHUB_ACTIONS: "true"
         run: |
           npm run build
+          rm -rf dist/assets/aistudio
           cp dist/index.html dist/404.html
           touch dist/.nojekyll
 
@@ -47,7 +45,18 @@ jobs:
         uses: actions/upload-pages-artifact@v3
         with:
           path: "./dist"
+          name: github-pages
 
+      - name: Wait for GitHub Artifact API indexing
+        run: sleep 3
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
