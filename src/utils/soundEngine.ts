@@ -43,6 +43,7 @@ class IntercomSoundEngine {
   private nextPcmPlayTime = 0;
   private remoteStreamSource: MediaStreamAudioSourceNode | null = null;
   private remotePresenceFilter: BiquadFilterNode | null = null;
+  private remoteHissCutFilter: BiquadFilterNode | null = null;
   private remoteCompressor: DynamicsCompressorNode | null = null;
   private remoteStreamGain: GainNode | null = null;
   private remoteHtmlAudioEl: HTMLAudioElement | null = null;
@@ -91,11 +92,12 @@ class IntercomSoundEngine {
     if (!this.remoteStreamGain) return;
     const isRunning = Boolean(this.ctx && this.ctx.state === 'running');
     if (isRunning) {
-      // Single clean path via WebAudio preamp + compressor (mute HTMLAudioElement to prevent comb-filtering / phase cancellation, while keeping Chrome's WebRTC decoder active!)
+      // Single clean path via WebAudio vocal EQ + anti-hiss lowpass + gentle compressor
+      // (mute HTMLAudioElement to prevent comb-filtering / phase cancellation while keeping Chrome's WebRTC decoder active)
       if (this.remoteHtmlAudioEl) {
         this.remoteHtmlAudioEl.muted = true;
       }
-      this.remoteStreamGain.gain.value = 2.25;
+      this.remoteStreamGain.gain.value = 1.5;
     } else {
       // AudioContext not yet unlocked by user gesture: play via HTMLAudioElement cleanly until unlocked
       if (this.remoteHtmlAudioEl) {
@@ -122,6 +124,10 @@ class IntercomSoundEngine {
         this.remotePresenceFilter.disconnect();
         this.remotePresenceFilter = null;
       }
+      if (this.remoteHissCutFilter) {
+        this.remoteHissCutFilter.disconnect();
+        this.remoteHissCutFilter = null;
+      }
       if (this.remoteCompressor) {
         this.remoteCompressor.disconnect();
         this.remoteCompressor = null;
@@ -134,23 +140,31 @@ class IntercomSoundEngine {
 
       this.remoteStreamSource = ctx.createMediaStreamSource(stream);
 
-      // Gentle high-shelf presence boost (2.4 kHz +4 dB) so consonants, sibilance, and room texture stay crisp and natural
+      // Gentle mid-range vocal clarity boost (1.8 kHz +1.8 dB) without boosting high-frequency mic hiss
       this.remotePresenceFilter = ctx.createBiquadFilter();
-      this.remotePresenceFilter.type = 'highshelf';
-      this.remotePresenceFilter.frequency.value = 2400;
-      this.remotePresenceFilter.gain.value = 4.0;
+      this.remotePresenceFilter.type = 'peaking';
+      this.remotePresenceFilter.frequency.value = 1800;
+      this.remotePresenceFilter.Q.value = 0.9;
+      this.remotePresenceFilter.gain.value = 1.8;
 
-      // Broadcast voice compressor so quiet speech and subtle ambient sounds are clearly audible without clipping
+      // Soft anti-hiss lowpass rolloff above 7.2 kHz to suppress broadband white noise
+      this.remoteHissCutFilter = ctx.createBiquadFilter();
+      this.remoteHissCutFilter.type = 'lowpass';
+      this.remoteHissCutFilter.frequency.value = 7200;
+      this.remoteHissCutFilter.Q.value = 0.7;
+
+      // Balanced voice compressor so speech stays clear and loud without pumping up silence/background hiss
       this.remoteCompressor = ctx.createDynamicsCompressor();
-      this.remoteCompressor.threshold.value = -28;
-      this.remoteCompressor.knee.value = 18;
-      this.remoteCompressor.ratio.value = 3.5;
-      this.remoteCompressor.attack.value = 0.004;
-      this.remoteCompressor.release.value = 0.16;
+      this.remoteCompressor.threshold.value = -20;
+      this.remoteCompressor.knee.value = 12;
+      this.remoteCompressor.ratio.value = 2.2;
+      this.remoteCompressor.attack.value = 0.008;
+      this.remoteCompressor.release.value = 0.18;
 
       this.remoteStreamGain = ctx.createGain();
       this.remoteStreamSource.connect(this.remotePresenceFilter);
-      this.remotePresenceFilter.connect(this.remoteCompressor);
+      this.remotePresenceFilter.connect(this.remoteHissCutFilter);
+      this.remoteHissCutFilter.connect(this.remoteCompressor);
       this.remoteCompressor.connect(this.remoteStreamGain);
       this.remoteStreamGain.connect(ctx.destination);
 
@@ -282,36 +296,45 @@ class IntercomSoundEngine {
       const channel = buffer.getChannelData(0);
 
       const now = ctx.currentTime;
-      const isUnderrun = this.nextPcmPlayTime < now || this.nextPcmPlayTime > now + 1.1;
+      const isUnderrun = this.nextPcmPlayTime < now || this.nextPcmPlayTime > now + 0.55;
       if (isUnderrun) {
-        // 110ms jitter buffer on initial chunk so consecutive network chunks play back-to-back without underruns
-        this.nextPcmPlayTime = now + 0.11;
+        // Tight 65ms jitter buffer keeps fallback voice responsive without sluggish delay
+        this.nextPcmPlayTime = now + 0.065;
       }
 
-      // Only apply a short 16-sample ramp at the very start of a new speech burst after an underrun;
-      // contiguous chunks must NOT dip to 0 at boundaries (which caused 5Hz voice tremolo/chop).
+      // Compute chunk RMS so pure 8-bit quantization hiss during silence is smoothly attenuated
+      let sumSq = 0;
+      for (let i = 0; i < samples.length; i++) {
+        sumSq += samples[i] * samples[i];
+      }
+      const rms = Math.sqrt(sumSq / samples.length);
+      const noiseExpanderGain =
+        rms < 0.012 ? 0.15 + 0.85 * Math.pow(rms / 0.012, 2) : 1.0;
+
+      // Only apply a short ramp at the start of a new burst after an underrun
       const fadeInLen = isUnderrun ? Math.min(24, Math.floor(samples.length / 8)) : 0;
       for (let i = 0; i < samples.length; i++) {
         const env = i < fadeInLen ? i / fadeInLen : 1.0;
-        channel[i] = samples[i] * env;
+        channel[i] = samples[i] * env * noiseExpanderGain;
       }
 
       const source = ctx.createBufferSource();
       source.buffer = buffer;
 
+      // 3.8 kHz lowpass cuts 8-bit PCM quantization white noise cleanly while preserving clear vocal tone
       const filterNode = ctx.createBiquadFilter();
       filterNode.type = 'lowpass';
-      filterNode.frequency.value = Math.min(5600, safeRate * 0.48);
+      filterNode.frequency.value = Math.min(3800, safeRate * 0.45);
 
       const compNode = ctx.createDynamicsCompressor();
-      compNode.threshold.value = -24;
-      compNode.knee.value = 18;
-      compNode.ratio.value = 3.2;
-      compNode.attack.value = 0.005;
-      compNode.release.value = 0.14;
+      compNode.threshold.value = -18;
+      compNode.knee.value = 12;
+      compNode.ratio.value = 2.2;
+      compNode.attack.value = 0.008;
+      compNode.release.value = 0.16;
 
       const gainNode = ctx.createGain();
-      gainNode.gain.value = 2.4;
+      gainNode.gain.value = 1.55;
 
       source.connect(filterNode);
       filterNode.connect(compNode);

@@ -417,7 +417,8 @@ interface SocketOutbox {
   timer: number | null;
 }
 
-const SOCKET_MIN_PACE_MS = 45;
+const MQTT_MIN_PACE_MS = 16;
+const JSON_RELAY_MIN_PACE_MS = 50;
 
 /**
  * Serverless P2P / Multi-Broker + Port-443 Mesh Coordinator so the entire 3D Intercom works on
@@ -544,6 +545,7 @@ class ServerlessMeshTransport implements IntercomTransport {
 
   private drainSocketOutbox(url: string) {
     const box = this.socketOutboxes.get(url);
+    const isJsonRelay = this.jsonRelaySockets.has(url);
     const ws = this.mqttSockets.get(url) || this.jsonRelaySockets.get(url);
     if (!box || !ws || ws.readyState !== WebSocket.OPEN) {
       if (box && box.timer !== null) {
@@ -553,14 +555,15 @@ class ServerlessMeshTransport implements IntercomTransport {
       return;
     }
 
+    const paceMs = isJsonRelay ? JSON_RELAY_MIN_PACE_MS : MQTT_MIN_PACE_MS;
     const now = performance.now();
     const elapsed = now - box.lastSentAt;
-    if (elapsed < SOCKET_MIN_PACE_MS) {
+    if (elapsed < paceMs) {
       if (box.timer === null) {
         box.timer = window.setTimeout(() => {
           box.timer = null;
           this.drainSocketOutbox(url);
-        }, Math.max(8, Math.ceil(SOCKET_MIN_PACE_MS - elapsed)));
+        }, Math.max(6, Math.ceil(paceMs - elapsed)));
       }
       return;
     }
@@ -597,7 +600,7 @@ class ServerlessMeshTransport implements IntercomTransport {
       box.timer = window.setTimeout(() => {
         box.timer = null;
         this.drainSocketOutbox(url);
-      }, SOCKET_MIN_PACE_MS);
+      }, paceMs);
     }
   }
 
@@ -612,13 +615,14 @@ class ServerlessMeshTransport implements IntercomTransport {
 
     if (category === 'urgent') {
       box.urgentQueue.push(packet);
-      if (box.urgentQueue.length > 24) {
+      // Generous cap so WebRTC offer/answer/ICE bursts never evict earlier signaling packets
+      if (box.urgentQueue.length > 80) {
         box.urgentQueue.shift();
       }
     } else if (category === 'audio') {
       box.audioQueue.push(packet);
-      // Keep audio real-time: cap buffered audio chunks at 4 (~720ms max)
-      while (box.audioQueue.length > 4) {
+      // Keep audio tightly real-time: cap buffered audio chunks at 2 (~200ms max)
+      while (box.audioQueue.length > 2) {
         box.audioQueue.shift();
       }
     } else if (category === 'frame') {
@@ -1006,50 +1010,52 @@ class ServerlessMeshTransport implements IntercomTransport {
 
     const isPresence = payload._mesh === 'presence';
     const category = isPresence ? 'presence' : 'urgent';
-    const mqttRoomPacket = buildMqttPublishPacket(MESH_TOPIC, raw).buffer as ArrayBuffer;
-    const jsonRoomPacket = buildSignedRelayEventPacket(raw, MESH_RELAY_TAG);
 
-    // 1. Send room packet across all active MQTT brokers and Port-443 JSON WebSocket Relays
-    for (const [url, ws] of this.mqttSockets.entries()) {
-      if (ws.readyState === WebSocket.OPEN && this.mqttConnackSet.has(url)) {
-        this.enqueueSocketSend(url, ws, mqttRoomPacket, category);
-      }
-    }
-    for (const [url, ws] of this.jsonRelaySockets.entries()) {
-      if (ws.readyState === WebSocket.OPEN) {
-        this.enqueueSocketSend(url, ws, jsonRoomPacket, category);
-      }
-    }
-
-    // 2. If this is a targeted signaling packet (call:invite, call:accept, webrtc:offer, webrtc:answer, webrtc:ice, chat:msg),
-    // ALSO send on the partner's direct topic/tag on their verified broker/relay for redundant direct delivery!
+    // For targeted signaling packets (WebRTC offer/answer/ICE, call:invite/accept, chat:msg),
+    // send ONLY the direct packet on sockets verified for that peer (zero double-queuing on the same socket!),
+    // and send the room packet on remaining open sockets for cross-broker redundancy.
+    const verifiedUrls = new Set<string>();
     if (!isPresence && targetId) {
       const peer = this.peers.get(targetId);
-      const verifiedUrls = new Set<string>();
       if (peer?.lastBrokerUrl) verifiedUrls.add(peer.lastBrokerUrl);
       if (peer?.verifiedBrokers) {
         for (const vb of peer.verifiedBrokers) verifiedUrls.add(vb);
       }
-      if (verifiedUrls.size > 0) {
-        let mqttDirectPacket: ArrayBuffer | null = null;
-        let jsonDirectPacket: string | null = null;
-        for (const vUrl of verifiedUrls) {
-          const mWs = this.mqttSockets.get(vUrl);
-          if (mWs && mWs.readyState === WebSocket.OPEN && this.mqttConnackSet.has(vUrl)) {
-            if (!mqttDirectPacket) {
-              mqttDirectPacket = buildMqttPublishPacket(getDirectTopic(targetId), raw)
-                .buffer as ArrayBuffer;
-            }
-            this.enqueueSocketSend(vUrl, mWs, mqttDirectPacket, 'urgent');
-          }
-          const rWs = this.jsonRelaySockets.get(vUrl);
-          if (rWs && rWs.readyState === WebSocket.OPEN) {
-            if (!jsonDirectPacket) {
-              jsonDirectPacket = buildSignedRelayEventPacket(raw, getDirectRelayTag(targetId));
-            }
-            this.enqueueSocketSend(vUrl, rWs, jsonDirectPacket, 'urgent');
-          }
+    }
+
+    let mqttRoomPacket: ArrayBuffer | null = null;
+    let jsonRoomPacket: string | null = null;
+    let mqttDirectPacket: ArrayBuffer | null = null;
+    let jsonDirectPacket: string | null = null;
+
+    for (const [url, ws] of this.mqttSockets.entries()) {
+      if (ws.readyState !== WebSocket.OPEN || !this.mqttConnackSet.has(url)) continue;
+      if (!isPresence && targetId && verifiedUrls.has(url)) {
+        if (!mqttDirectPacket) {
+          mqttDirectPacket = buildMqttPublishPacket(getDirectTopic(targetId), raw)
+            .buffer as ArrayBuffer;
         }
+        this.enqueueSocketSend(url, ws, mqttDirectPacket, category);
+      } else {
+        if (!mqttRoomPacket) {
+          mqttRoomPacket = buildMqttPublishPacket(MESH_TOPIC, raw).buffer as ArrayBuffer;
+        }
+        this.enqueueSocketSend(url, ws, mqttRoomPacket, category);
+      }
+    }
+
+    for (const [url, ws] of this.jsonRelaySockets.entries()) {
+      if (ws.readyState !== WebSocket.OPEN) continue;
+      if (!isPresence && targetId && verifiedUrls.has(url)) {
+        if (!jsonDirectPacket) {
+          jsonDirectPacket = buildSignedRelayEventPacket(raw, getDirectRelayTag(targetId));
+        }
+        this.enqueueSocketSend(url, ws, jsonDirectPacket, category);
+      } else {
+        if (!jsonRoomPacket) {
+          jsonRoomPacket = buildSignedRelayEventPacket(raw, MESH_RELAY_TAG);
+        }
+        this.enqueueSocketSend(url, ws, jsonRoomPacket, category);
       }
     }
   }
@@ -1995,7 +2001,7 @@ class ServerlessMeshTransport implements IntercomTransport {
 
       if (type === 'media:frame') {
         const now = Date.now();
-        if (now - this.lastFrameRelayAt < 100) {
+        if (now - this.lastFrameRelayAt < 60) {
           return;
         }
         this.lastFrameRelayAt = now;

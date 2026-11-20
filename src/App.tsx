@@ -23,13 +23,38 @@ import { createIntercomTransport, IntercomTransport } from './utils/networkTrans
 const RTC_CONFIG: RTCConfiguration = {
   iceServers: [
     { urls: 'stun:stun.sipnet.ru:3478' },
-    { urls: 'stun:stun.sipnet.net:3478' },
     { urls: 'stun:stun.cloudflare.com:3478' },
     { urls: 'stun:stun.nextcloud.com:443' },
-    { urls: 'stun:stun.zadarma.com:3478' },
   ],
   iceCandidatePoolSize: 4,
 };
+
+function filterExtraCandidates(
+  sdp: string | undefined,
+  candidates: RTCIceCandidateInit[]
+): RTCIceCandidateInit[] {
+  if (!candidates.length) return [];
+  if (!sdp) return candidates;
+  return candidates.filter((c) => {
+    if (!c.candidate) return false;
+    const raw = c.candidate.replace(/^a=/, '');
+    return !sdp.includes(raw);
+  });
+}
+
+let cachedSupportsWebp: boolean | null = null;
+function supportsCanvasWebp(): boolean {
+  if (cachedSupportsWebp !== null) return cachedSupportsWebp;
+  try {
+    const c = document.createElement('canvas');
+    c.width = 2;
+    c.height = 2;
+    cachedSupportsWebp = c.toDataURL('image/webp', 0.7).startsWith('data:image/webp');
+  } catch {
+    cachedSupportsWebp = false;
+  }
+  return cachedSupportsWebp;
+}
 
 function waitForIceGatheringBrief(pc: RTCPeerConnection, timeoutMs = 420): Promise<void> {
   if (pc.iceGatheringState === 'complete') {
@@ -242,6 +267,9 @@ export default function App() {
   const gatheredLocalCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   const sdpSentRef = useRef<boolean>(false);
   const trickleIceSentCountRef = useRef<number>(0);
+  const trickleIceBatchRef = useRef<RTCIceCandidateInit[]>([]);
+  const trickleIceFlushTimerRef = useRef<number | null>(null);
+  const lastMediaStateAckAtRef = useRef<number>(0);
   const webrtcOfferRetryTimerRef = useRef<number | null>(null);
   const iceRestartTimerRef = useRef<number | null>(null);
   const iceRestartedRef = useRef<boolean>(false);
@@ -417,7 +445,7 @@ export default function App() {
               },
               audio: {
                 echoCancellation: true,
-                noiseSuppression: false,
+                noiseSuppression: true,
                 autoGainControl: true,
                 sampleRate: { ideal: 48000 },
               },
@@ -452,7 +480,7 @@ export default function App() {
                   const audioOnly = await navigator.mediaDevices.getUserMedia({
                     audio: {
                       echoCancellation: true,
-                      noiseSuppression: false,
+                      noiseSuppression: true,
                       autoGainControl: true,
                       sampleRate: { ideal: 48000 },
                     },
@@ -662,6 +690,11 @@ export default function App() {
     gatheredLocalCandidatesRef.current = [];
     sdpSentRef.current = false;
     trickleIceSentCountRef.current = 0;
+    trickleIceBatchRef.current = [];
+    if (trickleIceFlushTimerRef.current !== null) {
+      window.clearTimeout(trickleIceFlushTimerRef.current);
+      trickleIceFlushTimerRef.current = null;
+    }
     iceRestartedRef.current = false;
     if (webrtcOfferRetryTimerRef.current !== null) {
       window.clearTimeout(webrtcOfferRetryTimerRef.current);
@@ -721,7 +754,10 @@ export default function App() {
               sendWs({
                 type: 'webrtc:offer',
                 sdp: existingPc.localDescription,
-                candidates: [...gatheredLocalCandidatesRef.current],
+                candidates: filterExtraCandidates(
+                  existingPc.localDescription?.sdp,
+                  gatheredLocalCandidatesRef.current
+                ),
               });
             } catch {
               // Ignore
@@ -790,7 +826,10 @@ export default function App() {
                 sendWs({
                   type: 'webrtc:offer',
                   sdp: pc.localDescription,
-                  candidates: [...gatheredLocalCandidatesRef.current],
+                  candidates: filterExtraCandidates(
+                    pc.localDescription.sdp,
+                    gatheredLocalCandidatesRef.current
+                  ),
                 });
               }
             } catch {
@@ -853,13 +892,22 @@ export default function App() {
             ) {
               gatheredLocalCandidatesRef.current.push(jsonCand);
             }
-            // Trickle up to 36 candidates so Windows/Android multi-NIC + STUN + IPv4 LAN candidates are NEVER truncated
+            // Batch trickle ICE candidates into compact bursts (90ms) so multi-NIC Windows/Android hosts
+            // never flood signaling queues or evict offer/answer packets
             if (sdpSentRef.current && trickleIceSentCountRef.current < 36) {
               trickleIceSentCountRef.current++;
-              sendWs({
-                type: 'webrtc:ice',
-                candidate: jsonCand,
-              });
+              trickleIceBatchRef.current.push(jsonCand);
+              if (trickleIceFlushTimerRef.current === null) {
+                trickleIceFlushTimerRef.current = window.setTimeout(() => {
+                  trickleIceFlushTimerRef.current = null;
+                  if (pcRef.current !== pc || trickleIceBatchRef.current.length === 0) return;
+                  const batch = trickleIceBatchRef.current.splice(0, trickleIceBatchRef.current.length);
+                  sendWs({
+                    type: 'webrtc:ice',
+                    candidates: batch,
+                  });
+                }, 90);
+              }
             }
           };
 
@@ -910,7 +958,27 @@ export default function App() {
             );
             stream.getTracks().forEach((track) => {
               if (!existingTrackIds.has(track.id)) {
-                pc.addTrack(track, stream);
+                if (track.kind === 'video' && 'contentHint' in track) {
+                  try {
+                    track.contentHint = 'motion';
+                  } catch {
+                    // Ignore unsupported contentHint
+                  }
+                }
+                const sender = pc.addTrack(track, stream);
+                if (track.kind === 'video' && typeof sender.getParameters === 'function') {
+                  try {
+                    const params = sender.getParameters();
+                    if (!params.encodings || params.encodings.length === 0) {
+                      params.encodings = [{}];
+                    }
+                    params.encodings[0].maxBitrate = 1_200_000;
+                    params.encodings[0].maxFramerate = 30;
+                    sender.setParameters(params).catch(() => {});
+                  } catch {
+                    // Ignore unsupported sender parameter tuning
+                  }
+                }
               }
             });
           }
@@ -924,14 +992,17 @@ export default function App() {
               offerToReceiveVideo: true,
             });
             await pc.setLocalDescription(offer);
-            // Gather host IPv4 + Russian/Cloudflare STUN ICE candidates (~150-420ms) and bundle them into webrtc:offer
+            // Gather host IPv4 + STUN ICE candidates (~150-420ms) inline inside localDescription.sdp
             await waitForIceGatheringBrief(pc, 420);
             sdpSentRef.current = true;
             if (pcRef.current === pc && pc.localDescription) {
               sendWs({
                 type: 'webrtc:offer',
                 sdp: pc.localDescription,
-                candidates: [...gatheredLocalCandidatesRef.current],
+                candidates: filterExtraCandidates(
+                  pc.localDescription.sdp,
+                  gatheredLocalCandidatesRef.current
+                ),
               });
             }
           };
@@ -949,7 +1020,10 @@ export default function App() {
                 sendWs({
                   type: 'webrtc:offer',
                   sdp: pc.localDescription,
-                  candidates: [...gatheredLocalCandidatesRef.current],
+                  candidates: filterExtraCandidates(
+                    pc.localDescription.sdp,
+                    gatheredLocalCandidatesRef.current
+                  ),
                 });
                 webrtcOfferRetryTimerRef.current = window.setTimeout(() => {
                   if (
@@ -960,7 +1034,10 @@ export default function App() {
                     sendWs({
                       type: 'webrtc:offer',
                       sdp: pc.localDescription,
-                      candidates: [...gatheredLocalCandidatesRef.current],
+                      candidates: filterExtraCandidates(
+                        pc.localDescription.sdp,
+                        gatheredLocalCandidatesRef.current
+                      ),
                     });
                   }
                 }, 1900);
@@ -1105,7 +1182,7 @@ export default function App() {
         return;
       }
       const isServerless = wsRef.current?.mode === 'serverless';
-      const minInterval = isServerless ? 115 : 95;
+      const minInterval = isServerless ? 68 : 75;
       if (now - lastFallbackFrameSentAt < minInterval) {
         return;
       }
@@ -1116,7 +1193,8 @@ export default function App() {
       const ctx = capCanvas.getContext('2d');
       if (!ctx) return;
 
-      const maxDim = isServerless ? 300 : 400;
+      const useWebp = supportsCanvasWebp();
+      const maxDim = isServerless ? (useWebp ? 420 : 340) : 440;
       const videoEl = localVideoRef.current;
       if (camEnabledRef.current && videoEl && videoEl.readyState >= 2 && videoEl.videoWidth > 0) {
         const vw = videoEl.videoWidth || 480;
@@ -1146,7 +1224,9 @@ export default function App() {
       }
 
       try {
-        const dataUrl = capCanvas.toDataURL('image/jpeg', isServerless ? 0.60 : 0.70);
+        const dataUrl = useWebp
+          ? capCanvas.toDataURL('image/webp', isServerless ? 0.68 : 0.74)
+          : capCanvas.toDataURL('image/jpeg', isServerless ? 0.62 : 0.72);
         sendWs({
           type: 'media:frame',
           frame: dataUrl,
@@ -1164,7 +1244,7 @@ export default function App() {
       camEnabled: camEnabledRef.current,
     });
 
-    const timer = window.setInterval(sendFrameNow, 95);
+    const timer = window.setInterval(sendFrameNow, 68);
 
     let audioCtx: AudioContext | null = null;
     let workletNode: AudioWorkletNode | null = null;
@@ -1203,7 +1283,7 @@ export default function App() {
         silentGain.connect(audioCtx.destination);
 
         let accum: number[] = [];
-        const CHUNK_SAMPLES = 2000; // ~166ms at 12kHz -> smooth continuous voice + ambient audio
+        const CHUNK_SAMPLES = 1200; // ~100ms at 12kHz -> low-latency voice without sluggish buffer delay
 
         const pushInputSamples = (input: Float32Array) => {
           if (
@@ -1223,8 +1303,8 @@ export default function App() {
             for (let k = startIdx; k < endIdx; k++) {
               sum += input[k];
             }
-            // Apply 1.65x mic pre-boost before companding so quiet speech and room rustle/breath are never clipped or gated out
-            accum.push((sum / Math.max(1, endIdx - startIdx)) * 1.65);
+            // Gentle 1.2x pre-boost keeps voice clear without amplifying mic hiss or 8-bit quantization floor
+            accum.push((sum / Math.max(1, endIdx - startIdx)) * 1.2);
           }
           while (accum.length >= CHUNK_SAMPLES) {
             const slice = accum.splice(0, CHUNK_SAMPLES);
@@ -1696,7 +1776,10 @@ export default function App() {
                   sendWs({
                     type: 'webrtc:answer',
                     sdp: pc.localDescription,
-                    candidates: [...gatheredLocalCandidatesRef.current],
+                    candidates: filterExtraCandidates(
+                      pc.localDescription.sdp,
+                      gatheredLocalCandidatesRef.current
+                    ),
                   });
                   break;
                 }
@@ -1708,14 +1791,17 @@ export default function App() {
                 await flushPendingIceCandidates(pc);
                 const answer = await pc.createAnswer();
                 await pc.setLocalDescription(answer);
-                // Gather host IPv4 + Russian/Cloudflare STUN ICE candidates (~150-420ms) and bundle them into webrtc:answer
+                // Gather host IPv4 + STUN ICE candidates (~150-420ms) inline inside localDescription.sdp
                 await waitForIceGatheringBrief(pc, 420);
                 sdpSentRef.current = true;
                 if (pcRef.current === pc && pc.localDescription) {
                   sendWs({
                     type: 'webrtc:answer',
                     sdp: pc.localDescription,
-                    candidates: [...gatheredLocalCandidatesRef.current],
+                    candidates: filterExtraCandidates(
+                      pc.localDescription.sdp,
+                      gatheredLocalCandidatesRef.current
+                    ),
                   });
                 }
               }
@@ -1759,12 +1845,20 @@ export default function App() {
 
           case 'webrtc:ice': {
             try {
-              if (!msg.candidate) break;
+              const incomingList: RTCIceCandidateInit[] = Array.isArray(msg.candidates)
+                ? msg.candidates
+                : msg.candidate
+                  ? [msg.candidate]
+                  : [];
+              if (incomingList.length === 0) break;
               const pc = pcRef.current;
-              if (!pc || !pc.remoteDescription || !pc.remoteDescription.type) {
-                pendingIceCandidatesRef.current.push(msg.candidate);
-              } else {
-                await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+              for (const cand of incomingList) {
+                if (!cand || typeof cand.candidate !== 'string') continue;
+                if (!pc || !pc.remoteDescription || !pc.remoteDescription.type) {
+                  pendingIceCandidatesRef.current.push(cand);
+                } else {
+                  await pc.addIceCandidate(new RTCIceCandidate(cand));
+                }
               }
             } catch {
               // Ignore
@@ -1797,6 +1891,16 @@ export default function App() {
             }
             if (typeof msg.frame === 'string' && !webrtcVideoRxRef.current) {
               drawFrameToRemoteCanvas(msg.frame);
+            } else if (webrtcVideoRxRef.current && Date.now() - lastMediaStateAckAtRef.current > 2000) {
+              // Re-confirm live WebRTC video reception so the peer immediately halts redundant fallback frames
+              lastMediaStateAckAtRef.current = Date.now();
+              sendWs({
+                type: 'media:state',
+                micEnabled: micEnabledRef.current,
+                camEnabled: camEnabledRef.current,
+                webrtcAudioRx: webrtcAudioRxRef.current || webrtcConnectedRef.current,
+                webrtcVideoRx: true,
+              });
             }
             break;
           }
