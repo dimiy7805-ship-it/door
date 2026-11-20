@@ -1518,8 +1518,7 @@ class ServerlessMeshTransport implements IntercomTransport {
     if (meshType === 'call:resume') {
       const resumeCallId = String(pkt.callId || '');
       const peerPin = String(pkt._fromPin || this.partnerPin || '');
-      if (this.callId === resumeCallId || !this.callId) {
-        this.callId = resumeCallId;
+      if (this.callId && this.callId === resumeCallId) {
         this.isCallOutgoingWaiting = false;
         this.callAnswered = true;
         this.callConnectedAt = Date.now();
@@ -1537,12 +1536,27 @@ class ServerlessMeshTransport implements IntercomTransport {
           mode: this.callMode,
         });
         this.broadcastPresencePacket();
+      } else if (resumeCallId) {
+        // We already ended this call — notify returning peer so they exit cleanly instead of resurrecting a dead call!
+        this.publishWire(
+          {
+            _mesh: 'call:end',
+            targetId: fromId,
+            callId: resumeCallId,
+          },
+          { directTargetId: fromId }
+        );
       }
       return;
     }
 
     if (meshType === 'call:end') {
-      if (this.partnerClientId === fromId && this.callId) {
+      const endCallId = String(pkt.callId || '');
+      if (
+        this.partnerClientId === fromId &&
+        this.callId &&
+        (!endCallId || endCallId === this.callId)
+      ) {
         this.handlePartnerLeftCall();
       }
       return;
@@ -1956,7 +1970,8 @@ class ServerlessMeshTransport implements IntercomTransport {
       type === 'media:frame' ||
       type === 'media:audio' ||
       type === 'media:state' ||
-      type === 'chat:msg'
+      type === 'chat:msg' ||
+      type === 'chat:sync'
     ) {
       if (!this.partnerClientId || !this.callId) return;
       if (type === 'chat:msg') {
@@ -1980,7 +1995,7 @@ class ServerlessMeshTransport implements IntercomTransport {
 
       if (type === 'media:frame') {
         const now = Date.now();
-        if (now - this.lastFrameRelayAt < 140) {
+        if (now - this.lastFrameRelayAt < 100) {
           return;
         }
         this.lastFrameRelayAt = now;

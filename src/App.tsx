@@ -31,7 +31,7 @@ const RTC_CONFIG: RTCConfiguration = {
   iceCandidatePoolSize: 4,
 };
 
-function waitForIceGatheringBrief(pc: RTCPeerConnection, timeoutMs = 220): Promise<void> {
+function waitForIceGatheringBrief(pc: RTCPeerConnection, timeoutMs = 420): Promise<void> {
   if (pc.iceGatheringState === 'complete') {
     return Promise.resolve();
   }
@@ -52,6 +52,65 @@ function waitForIceGatheringBrief(pc: RTCPeerConnection, timeoutMs = 220): Promi
     const timer = window.setTimeout(finish, timeoutMs);
     pc.addEventListener('icegatheringstatechange', onState);
   });
+}
+
+function getCallChatStorageKey(callId: string): string {
+  return `intercom_chat_history_${callId}`;
+}
+
+function loadSavedCallChat(callId: string | null): ChatMessage[] {
+  if (!callId) return [];
+  try {
+    const raw = localStorage.getItem(getCallChatStorageKey(callId));
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((m) => m && typeof m.id === 'string' && typeof m.text === 'string')
+      .map((m) => ({
+        id: String(m.id),
+        senderPin: String(m.senderPin || '---'),
+        text: String(m.text),
+        timestamp: Number(m.timestamp) || Date.now(),
+        isSelf: Boolean(m.isSelf),
+      }))
+      .slice(-80);
+  } catch {
+    return [];
+  }
+}
+
+function saveCallChat(callId: string | null, messages: ChatMessage[]) {
+  if (!callId) return;
+  try {
+    localStorage.setItem(getCallChatStorageKey(callId), JSON.stringify(messages.slice(-80)));
+  } catch {
+    // Ignore storage quota errors
+  }
+}
+
+function clearSavedCallChat(callId: string | null) {
+  if (!callId) return;
+  try {
+    localStorage.removeItem(getCallChatStorageKey(callId));
+  } catch {
+    // Ignore
+  }
+}
+
+function mergeChatLists(base: ChatMessage[], incoming: ChatMessage[]): ChatMessage[] {
+  const byId = new Map<string, ChatMessage>();
+  for (const m of base) {
+    byId.set(m.id, m);
+  }
+  for (const m of incoming) {
+    if (!byId.has(m.id)) {
+      byId.set(m.id, m);
+    }
+  }
+  return Array.from(byId.values())
+    .sort((a, b) => a.timestamp - b.timestamp)
+    .slice(-80);
 }
 
 const LEASE_TTL_MS = 4500;
@@ -159,6 +218,7 @@ export default function App() {
   const wsRef = useRef<IntercomTransport | null>(null);
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const pcInitPromiseRef = useRef<Promise<RTCPeerConnection | null> | null>(null);
+  const mediaInitPromiseRef = useRef<Promise<MediaStream | null> | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const hasHardwareVideoRef = useRef<boolean>(false);
   const hasHardwareAudioRef = useRef<boolean>(false);
@@ -183,7 +243,10 @@ export default function App() {
   const sdpSentRef = useRef<boolean>(false);
   const trickleIceSentCountRef = useRef<number>(0);
   const webrtcOfferRetryTimerRef = useRef<number | null>(null);
+  const iceRestartTimerRef = useRef<number | null>(null);
+  const iceRestartedRef = useRef<boolean>(false);
   const baselinePeerIsPortraitRef = useRef<boolean | null>(null);
+  const activeCallIdRef = useRef<string | null>(null);
 
   const brandRef = useRef(brand);
   brandRef.current = brand;
@@ -201,6 +264,8 @@ export default function App() {
   isChatOpenRef.current = isChatOpen;
   const callStateRef = useRef(callState);
   callStateRef.current = callState;
+  const chatMessagesRef = useRef(chatMessages);
+  chatMessagesRef.current = chatMessages;
 
   const drawFrameToRemoteCanvas = useCallback((frameDataUrl: string) => {
     if (!frameDataUrl) return;
@@ -235,8 +300,13 @@ export default function App() {
     img.src = frameDataUrl;
   }, []);
 
-  const resetCallChat = useCallback(() => {
+  const resetCallChat = useCallback((clearStoredHistory = true) => {
+    if (clearStoredHistory && activeCallIdRef.current) {
+      clearSavedCallChat(activeCallIdRef.current);
+      activeCallIdRef.current = null;
+    }
     setChatMessages([]);
+    chatMessagesRef.current = [];
     setUnreadChatCount(0);
     setToastChatMsg(null);
     setIsChatOpen(false);
@@ -258,18 +328,17 @@ export default function App() {
       remoteVideoRef.current.play().catch(() => {});
     }
     if (remoteAudioRef.current) {
-      remoteAudioRef.current.muted = false;
-      remoteAudioRef.current.volume = 1.0;
-      remoteAudioRef.current
+      const audioEl = remoteAudioRef.current;
+      audioEl
         .play()
         .then(() => {
           if (remoteAudioStreamRef.current) {
-            soundEngine.attachRemoteWebRtcAudioBackup(remoteAudioStreamRef.current, true);
+            soundEngine.attachRemoteWebRtcAudioBackup(remoteAudioStreamRef.current, true, audioEl);
           }
         })
         .catch(() => {
           if (remoteAudioStreamRef.current) {
-            soundEngine.attachRemoteWebRtcAudioBackup(remoteAudioStreamRef.current, false);
+            soundEngine.attachRemoteWebRtcAudioBackup(remoteAudioStreamRef.current, false, audioEl);
           }
         });
     }
@@ -291,6 +360,10 @@ export default function App() {
 
   const ensureLocalMedia = useCallback(
     async (forceFacingMode?: 'user' | 'environment'): Promise<MediaStream | null> => {
+      if (!forceFacingMode && mediaInitPromiseRef.current) {
+        return mediaInitPromiseRef.current;
+      }
+
       const targetFacing = forceFacingMode || facingModeRef.current;
 
       const existing = localStreamRef.current;
@@ -325,20 +398,22 @@ export default function App() {
         return null;
       }
 
+      const task = (async (): Promise<MediaStream | null> => {
       let acquiredVideoTrack: MediaStreamTrack | null =
         !forceFacingMode && hasLiveVideo && existing ? existing.getVideoTracks()[0] || null : null;
       let acquiredAudioTrack: MediaStreamTrack | null =
         hasLiveAudio && existing ? existing.getAudioTracks()[0] || null : null;
 
       if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-        // 1. Try combined audio + video with preferred camera facingMode
+        // 1. Try combined audio + video with preferred camera facingMode at crisp 640x480 @ 30fps
         if (!acquiredVideoTrack || !acquiredAudioTrack || forceFacingMode) {
           try {
             const combined = await navigator.mediaDevices.getUserMedia({
               video: {
                 facingMode: { ideal: targetFacing },
-                width: { ideal: 480 },
-                height: { ideal: 360 },
+                width: { ideal: 640 },
+                height: { ideal: 480 },
+                frameRate: { ideal: 30 },
               },
               audio: {
                 echoCancellation: true,
@@ -511,6 +586,16 @@ export default function App() {
       }
 
       return finalStream;
+      })();
+
+      mediaInitPromiseRef.current = task;
+      try {
+        return await task;
+      } finally {
+        if (mediaInitPromiseRef.current === task) {
+          mediaInitPromiseRef.current = null;
+        }
+      }
     },
     []
   );
@@ -577,9 +662,14 @@ export default function App() {
     gatheredLocalCandidatesRef.current = [];
     sdpSentRef.current = false;
     trickleIceSentCountRef.current = 0;
+    iceRestartedRef.current = false;
     if (webrtcOfferRetryTimerRef.current !== null) {
       window.clearTimeout(webrtcOfferRetryTimerRef.current);
       webrtcOfferRetryTimerRef.current = null;
+    }
+    if (iceRestartTimerRef.current !== null) {
+      window.clearTimeout(iceRestartTimerRef.current);
+      iceRestartTimerRef.current = null;
     }
     if (pcRef.current) {
       try {
@@ -596,19 +686,27 @@ export default function App() {
     remoteStreamRef.current = null;
     remoteVideoStreamRef.current = null;
     remoteAudioStreamRef.current = null;
-    soundEngine.attachRemoteWebRtcAudioBackup(null, true);
+    soundEngine.attachRemoteWebRtcAudioBackup(null, true, null);
     if (remoteVideoRef.current) {
+      remoteVideoRef.current.onloadeddata = null;
+      remoteVideoRef.current.onplaying = null;
       remoteVideoRef.current.srcObject = null;
     }
     if (remoteAudioRef.current) {
       remoteAudioRef.current.srcObject = null;
     }
+    if (remoteCanvasDisplayRef.current) {
+      const rCtx = remoteCanvasDisplayRef.current.getContext('2d');
+      if (rCtx) {
+        rCtx.clearRect(0, 0, remoteCanvasDisplayRef.current.width, remoteCanvasDisplayRef.current.height);
+      }
+    }
   }, []);
 
   const startWebRtcSession = useCallback(
-    async (initiator: boolean): Promise<RTCPeerConnection | null> => {
-      // If a peer connection initialization is already in flight or active, reuse it instead of racing!
-      if (pcInitPromiseRef.current) {
+    async (initiator: boolean, forceRestart = false): Promise<RTCPeerConnection | null> => {
+      // If a peer connection initialization is already in flight, reuse it instead of racing!
+      if (!forceRestart && pcInitPromiseRef.current) {
         const existingPc = await pcInitPromiseRef.current;
         if (existingPc && existingPc.signalingState !== 'closed') {
           if (initiator && existingPc.signalingState === 'stable' && !existingPc.remoteDescription) {
@@ -618,7 +716,7 @@ export default function App() {
                 offerToReceiveVideo: true,
               });
               await existingPc.setLocalDescription(offer);
-              await waitForIceGatheringBrief(existingPc, 220);
+              await waitForIceGatheringBrief(existingPc, 420);
               sdpSentRef.current = true;
               sendWs({
                 type: 'webrtc:offer',
@@ -633,7 +731,8 @@ export default function App() {
         }
       }
 
-      if (!initiator && pcRef.current && pcRef.current.signalingState !== 'closed') {
+      // Reuse already-active peer connection for this call (prevents Roulette tConn from tearing down a live P2P session!)
+      if (!forceRestart && pcRef.current && pcRef.current.signalingState !== 'closed') {
         return pcRef.current;
       }
 
@@ -650,6 +749,55 @@ export default function App() {
           const combinedRemote = new MediaStream();
           remoteStreamRef.current = combinedRemote;
 
+          const notifyVideoFlowingIfReady = () => {
+            if (pcRef.current !== pc) return;
+            const rv = remoteVideoRef.current;
+            if (rv && rv.readyState >= 2 && rv.videoWidth > 0 && !webrtcVideoRxRef.current) {
+              webrtcVideoRxRef.current = true;
+              sendWs({
+                type: 'media:state',
+                micEnabled: micEnabledRef.current,
+                camEnabled: camEnabledRef.current,
+                webrtcAudioRx: webrtcAudioRxRef.current || webrtcConnectedRef.current,
+                webrtcVideoRx: true,
+              });
+            }
+          };
+
+          const triggerOneShotIceRestart = async () => {
+            if (
+              !initiator ||
+              iceRestartedRef.current ||
+              pcRef.current !== pc ||
+              pc.signalingState === 'closed' ||
+              webrtcConnectedRef.current
+            ) {
+              return;
+            }
+            iceRestartedRef.current = true;
+            try {
+              gatheredLocalCandidatesRef.current = [];
+              trickleIceSentCountRef.current = 0;
+              const offer = await pc.createOffer({
+                iceRestart: true,
+                offerToReceiveAudio: true,
+                offerToReceiveVideo: true,
+              });
+              await pc.setLocalDescription(offer);
+              await waitForIceGatheringBrief(pc, 420);
+              sdpSentRef.current = true;
+              if (pcRef.current === pc && pc.localDescription) {
+                sendWs({
+                  type: 'webrtc:offer',
+                  sdp: pc.localDescription,
+                  candidates: [...gatheredLocalCandidatesRef.current],
+                });
+              }
+            } catch {
+              // Ignore
+            }
+          };
+
           const updateConnectedState = () => {
             if (pcRef.current !== pc) return;
             const isConn =
@@ -658,18 +806,32 @@ export default function App() {
               pc.iceConnectionState === 'completed';
             webrtcConnectedRef.current = isConn;
             if (isConn) {
+              if (iceRestartTimerRef.current !== null) {
+                window.clearTimeout(iceRestartTimerRef.current);
+                iceRestartTimerRef.current = null;
+              }
               webrtcAudioRxRef.current = true;
-              webrtcVideoRxRef.current = true;
-              peerWebrtcAudioRxRef.current = true;
-              peerWebrtcVideoRxRef.current = true;
+              const hasDecodedVideo = Boolean(
+                remoteVideoRef.current &&
+                  remoteVideoRef.current.readyState >= 2 &&
+                  remoteVideoRef.current.videoWidth > 0
+              );
+              if (hasDecodedVideo) {
+                webrtcVideoRxRef.current = true;
+              }
               sendWs({
                 type: 'media:state',
                 micEnabled: micEnabledRef.current,
                 camEnabled: camEnabledRef.current,
                 webrtcAudioRx: true,
-                webrtcVideoRx: true,
+                webrtcVideoRx: hasDecodedVideo,
               });
               unlockRemoteAudioElements();
+            } else if (
+              initiator &&
+              (pc.iceConnectionState === 'failed' || pc.connectionState === 'failed')
+            ) {
+              triggerOneShotIceRestart().catch(() => {});
             }
           };
 
@@ -691,8 +853,8 @@ export default function App() {
             ) {
               gatheredLocalCandidatesRef.current.push(jsonCand);
             }
-            // Trickle any late candidates (up to 6 max) that arrive AFTER the bundled Offer or Answer was sent
-            if (sdpSentRef.current && trickleIceSentCountRef.current < 6) {
+            // Trickle up to 36 candidates so Windows/Android multi-NIC + STUN + IPv4 LAN candidates are NEVER truncated
+            if (sdpSentRef.current && trickleIceSentCountRef.current < 36) {
               trickleIceSentCountRef.current++;
               sendWs({
                 type: 'webrtc:ice',
@@ -714,25 +876,27 @@ export default function App() {
                 remoteVideoRef.current.srcObject = vidStream;
                 // Keep remoteVideoRef strictly muted so mobile browsers never block video decoding!
                 remoteVideoRef.current.muted = true;
+                remoteVideoRef.current.onloadeddata = notifyVideoFlowingIfReady;
+                remoteVideoRef.current.onplaying = notifyVideoFlowingIfReady;
                 remoteVideoRef.current.play().catch(() => {});
               }
             } else if (event.track.kind === 'audio') {
               const audStream = new MediaStream([event.track]);
               remoteAudioStreamRef.current = audStream;
               if (remoteAudioRef.current) {
-                remoteAudioRef.current.srcObject = audStream;
-                remoteAudioRef.current.muted = false;
-                remoteAudioRef.current.volume = 1.0;
-                remoteAudioRef.current
+                const audioEl = remoteAudioRef.current;
+                audioEl.srcObject = audStream;
+                audioEl.volume = 1.0;
+                audioEl
                   .play()
                   .then(() => {
-                    soundEngine.attachRemoteWebRtcAudioBackup(audStream, true);
+                    soundEngine.attachRemoteWebRtcAudioBackup(audStream, true, audioEl);
                   })
                   .catch(() => {
-                    soundEngine.attachRemoteWebRtcAudioBackup(audStream, false);
+                    soundEngine.attachRemoteWebRtcAudioBackup(audStream, false, audioEl);
                   });
               } else {
-                soundEngine.attachRemoteWebRtcAudioBackup(audStream, false);
+                soundEngine.attachRemoteWebRtcAudioBackup(audStream, false, null);
               }
             }
           };
@@ -760,8 +924,8 @@ export default function App() {
               offerToReceiveVideo: true,
             });
             await pc.setLocalDescription(offer);
-            // Gather fast host + Russian STUN ICE candidates (~80-220ms) and bundle them into webrtc:offer
-            await waitForIceGatheringBrief(pc, 220);
+            // Gather host IPv4 + Russian/Cloudflare STUN ICE candidates (~150-420ms) and bundle them into webrtc:offer
+            await waitForIceGatheringBrief(pc, 420);
             sdpSentRef.current = true;
             if (pcRef.current === pc && pc.localDescription) {
               sendWs({
@@ -802,6 +966,17 @@ export default function App() {
                 }, 1900);
               }
             }, 1300);
+
+            // If ICE still hasn't reached 'connected' after 4.2s (e.g. Wi-Fi candidate race), perform a single clean ICE restart
+            iceRestartTimerRef.current = window.setTimeout(() => {
+              if (
+                pcRef.current === pc &&
+                !webrtcConnectedRef.current &&
+                pc.signalingState !== 'closed'
+              ) {
+                triggerOneShotIceRestart().catch(() => {});
+              }
+            }, 4200);
           } else if (!initiator) {
             // Strict single-initiator prevents symmetric rollback glare: if callee hasn't received caller's offer
             // within 1.5s, ask caller to immediately re-transmit its bundled offer.
@@ -925,12 +1100,12 @@ export default function App() {
 
     const sendFrameNow = () => {
       const now = Date.now();
-      // Give WebRTC offer/answer/ICE a 1.1s uncongested window at call start, and stop fallback frames once WebRTC video is live
-      if (now - callConnectTs < 1100 || webrtcConnectedRef.current || peerWebrtcVideoRxRef.current) {
+      // Give WebRTC offer/answer a brief 500ms head start, and stop fallback frames once peer actually receives live WebRTC video
+      if (now - callConnectTs < 500 || peerWebrtcVideoRxRef.current) {
         return;
       }
       const isServerless = wsRef.current?.mode === 'serverless';
-      const minInterval = isServerless ? 155 : 110;
+      const minInterval = isServerless ? 115 : 95;
       if (now - lastFallbackFrameSentAt < minInterval) {
         return;
       }
@@ -941,7 +1116,7 @@ export default function App() {
       const ctx = capCanvas.getContext('2d');
       if (!ctx) return;
 
-      const maxDim = isServerless ? 240 : 380;
+      const maxDim = isServerless ? 300 : 400;
       const videoEl = localVideoRef.current;
       if (camEnabledRef.current && videoEl && videoEl.readyState >= 2 && videoEl.videoWidth > 0) {
         const vw = videoEl.videoWidth || 480;
@@ -971,7 +1146,7 @@ export default function App() {
       }
 
       try {
-        const dataUrl = capCanvas.toDataURL('image/jpeg', isServerless ? 0.54 : 0.68);
+        const dataUrl = capCanvas.toDataURL('image/jpeg', isServerless ? 0.60 : 0.70);
         sendWs({
           type: 'media:frame',
           frame: dataUrl,
@@ -989,7 +1164,7 @@ export default function App() {
       camEnabled: camEnabledRef.current,
     });
 
-    const timer = window.setInterval(sendFrameNow, 105);
+    const timer = window.setInterval(sendFrameNow, 95);
 
     let audioCtx: AudioContext | null = null;
     let workletNode: AudioWorkletNode | null = null;
@@ -1035,7 +1210,7 @@ export default function App() {
             !micEnabledRef.current ||
             webrtcConnectedRef.current ||
             peerWebrtcAudioRxRef.current ||
-            Date.now() - callConnectTs < 1100
+            Date.now() - callConnectTs < 650
           ) {
             accum = [];
             return;
@@ -1258,26 +1433,37 @@ export default function App() {
             clearAutoDialTimers();
             soundEngine.stopRingLoop();
             const isResumed = Boolean(msg.resumed);
+            const incomingCallId = typeof msg.callId === 'string' && msg.callId ? msg.callId : null;
             if (!isResumed) {
-              resetCallChat();
+              resetCallChat(true);
+              activeCallIdRef.current = incomingCallId;
               soundEngine.playConnectedChime();
             } else {
-              if (Array.isArray(msg.messages)) {
-                const restored: ChatMessage[] = msg.messages
-                  .map((m: Record<string, any>) => {
-                    const clean = sanitizeChatMessage(m.text);
-                    if (!clean) return null;
-                    const senderPin = String(m.fromPin || '---');
-                    return {
-                      id: String(m.id || `m_${Date.now()}`),
-                      senderPin,
-                      text: clean,
-                      timestamp: Number(m.timestamp) || Date.now(),
-                      isSelf: senderPin === myPinRef.current,
-                    };
-                  })
-                  .filter(Boolean) as ChatMessage[];
-                setChatMessages(restored);
+              if (incomingCallId) {
+                activeCallIdRef.current = incomingCallId;
+              }
+              const localSaved = loadSavedCallChat(activeCallIdRef.current);
+              const serverRestored: ChatMessage[] = Array.isArray(msg.messages)
+                ? (msg.messages
+                    .map((m: Record<string, any>) => {
+                      const clean = sanitizeChatMessage(m.text);
+                      if (!clean) return null;
+                      const senderPin = String(m.fromPin || m.senderPin || '---');
+                      return {
+                        id: String(m.id || `m_${Date.now()}`),
+                        senderPin,
+                        text: clean,
+                        timestamp: Number(m.timestamp) || Date.now(),
+                        isSelf: senderPin === myPinRef.current,
+                      };
+                    })
+                    .filter(Boolean) as ChatMessage[])
+                : [];
+              const mergedRestored = mergeChatLists(localSaved, serverRestored);
+              if (mergedRestored.length > 0) {
+                setChatMessages(mergedRestored);
+                chatMessagesRef.current = mergedRestored;
+                saveCallChat(activeCallIdRef.current, mergedRestored);
               }
               if (msg.peerMediaState && typeof msg.peerMediaState === 'object') {
                 if (typeof msg.peerMediaState.cam === 'boolean') {
@@ -1309,7 +1495,7 @@ export default function App() {
             const peer = String(msg.peerPin || '');
             setPeerPin(peer);
             setCallState('connected');
-            await startWebRtcSession(Boolean(msg.initiator));
+            await startWebRtcSession(Boolean(msg.initiator), isResumed);
             break;
           }
 
@@ -1321,20 +1507,38 @@ export default function App() {
           case 'call:peer_resumed': {
             const peer = String(msg.peerPin || '');
             if (peer) setPeerPin(peer);
+            if (typeof msg.callId === 'string' && msg.callId) {
+              activeCallIdRef.current = msg.callId;
+            }
             setCallState('connected');
             unlockRemoteAudioElements();
-            await startWebRtcSession(Boolean(msg.initiator));
+            await startWebRtcSession(Boolean(msg.initiator), true);
             sendWs({
               type: 'media:state',
               micEnabled: micEnabledRef.current,
               camEnabled: camEnabledRef.current,
             });
+            // Sync full active-call chat history to the returning peer so messages sent while they refreshed/were away are restored!
+            if (chatMessagesRef.current.length > 0) {
+              const snapshot = chatMessagesRef.current.slice(-80).map((m) => ({
+                id: m.id,
+                senderPin: m.isSelf ? myPinRef.current || m.senderPin : m.senderPin,
+                text: m.text,
+                timestamp: m.timestamp,
+              }));
+              window.setTimeout(() => {
+                sendWs({
+                  type: 'chat:sync',
+                  messages: snapshot,
+                });
+              }, 350);
+            }
             break;
           }
 
           case 'roulette:searching': {
             clearAutoDialTimers();
-            resetCallChat();
+            resetCallChat(true);
             soundEngine.stopRingLoop();
             closePeerConnection();
             setPeerPin(null);
@@ -1347,7 +1551,8 @@ export default function App() {
 
           case 'roulette:matched': {
             clearAutoDialTimers();
-            resetCallChat();
+            resetCallChat(true);
+            activeCallIdRef.current = typeof msg.callId === 'string' && msg.callId ? msg.callId : null;
             soundEngine.stopRingLoop();
             const matchedPin = String(msg.peerPin || '');
             const initiator = Boolean(msg.initiator);
@@ -1358,7 +1563,7 @@ export default function App() {
 
             // Start WebRTC negotiation in the background immediately while the keypad digits animate!
             unlockRemoteAudioElements();
-            startWebRtcSession(initiator);
+            startWebRtcSession(initiator, true);
 
             const digits = matchedPin.split('');
             digits.forEach((digit, idx) => {
@@ -1503,8 +1708,8 @@ export default function App() {
                 await flushPendingIceCandidates(pc);
                 const answer = await pc.createAnswer();
                 await pc.setLocalDescription(answer);
-                // Gather fast host + Russian STUN ICE candidates (~80-220ms) and bundle them into webrtc:answer
-                await waitForIceGatheringBrief(pc, 220);
+                // Gather host IPv4 + Russian/Cloudflare STUN ICE candidates (~150-420ms) and bundle them into webrtc:answer
+                await waitForIceGatheringBrief(pc, 420);
                 sdpSentRef.current = true;
                 if (pcRef.current === pc && pc.localDescription) {
                   sendWs({
@@ -1590,11 +1795,7 @@ export default function App() {
             if (typeof msg.camEnabled === 'boolean') {
               setPeerCamEnabled(msg.camEnabled);
             }
-            if (
-              typeof msg.frame === 'string' &&
-              !webrtcConnectedRef.current &&
-              !webrtcVideoRxRef.current
-            ) {
+            if (typeof msg.frame === 'string' && !webrtcVideoRxRef.current) {
               drawFrameToRemoteCanvas(msg.frame);
             }
             break;
@@ -1606,6 +1807,34 @@ export default function App() {
                 soundEngine.playPcm8Base64Chunk(msg.pcm8, Number(msg.rate) || 8000);
               } else if (Array.isArray(msg.samples)) {
                 soundEngine.playPcmFloat32Chunk(msg.samples, Number(msg.rate) || 12000);
+              }
+            }
+            break;
+          }
+
+          case 'chat:sync': {
+            if (Array.isArray(msg.messages)) {
+              const incomingList: ChatMessage[] = msg.messages
+                .map((m: Record<string, any>) => {
+                  const clean = sanitizeChatMessage(m.text);
+                  if (!clean) return null;
+                  const senderPin = String(m.senderPin || m.fromPin || '---');
+                  return {
+                    id: String(m.id || `sync_${Date.now()}`),
+                    senderPin,
+                    text: clean,
+                    timestamp: Number(m.timestamp) || Date.now(),
+                    isSelf: senderPin === myPinRef.current,
+                  };
+                })
+                .filter(Boolean) as ChatMessage[];
+              if (incomingList.length > 0) {
+                setChatMessages((prev) => {
+                  const merged = mergeChatLists(prev, incomingList);
+                  chatMessagesRef.current = merged;
+                  saveCallChat(activeCallIdRef.current, merged);
+                  return merged;
+                });
               }
             }
             break;
@@ -1623,7 +1852,10 @@ export default function App() {
             };
             setChatMessages((prev) => {
               if (prev.some((m) => m.id === incomingMsg.id)) return prev;
-              return [...prev.slice(-79), incomingMsg];
+              const next = [...prev.slice(-79), incomingMsg];
+              chatMessagesRef.current = next;
+              saveCallChat(activeCallIdRef.current, next);
+              return next;
             });
             soundEngine.playKeyBeep(brandRef.current);
 
@@ -1866,7 +2098,12 @@ export default function App() {
         timestamp: Date.now(),
         isSelf: true,
       };
-      setChatMessages((prev) => [...prev.slice(-79), msgObj]);
+      setChatMessages((prev) => {
+        const next = [...prev.slice(-79), msgObj];
+        chatMessagesRef.current = next;
+        saveCallChat(activeCallIdRef.current, next);
+        return next;
+      });
       sendWs({
         type: 'chat:msg',
         id: msgObj.id,
@@ -2107,14 +2344,14 @@ export default function App() {
         }`}
         aria-hidden={isSceneReady}
       >
-        <div className="flex items-center gap-2.5 px-4.5 py-2.5 rounded-[10px] bg-[#121417] border border-white/[0.07] shadow-[0_12px_32px_rgba(0,0,0,0.6)]">
-          <span className="w-2 h-2 rounded-full bg-red-500 shadow-[0_0_10px_#ef4444] animate-pulse" />
+        <div className="flex items-center gap-2.5 px-[18px] py-[10px] rounded-[10px] bg-[#121417] border border-white/[0.07] shadow-[0_12px_32px_rgba(0,0,0,0.6)]">
+          <span className="w-2 h-2 rounded-full bg-[#ef4444] shadow-[0_0_10px_#ef4444] animate-pulse" />
           <span className="font-mono text-[13px] font-bold tracking-[0.14em] text-[#d4d7dd]">
             ДОМОФОН.ЛИНИЯ
           </span>
         </div>
         <div className="mt-3.5 w-[148px] h-[2px] rounded-full bg-white/[0.08] overflow-hidden relative">
-          <div className="w-1/2 h-full rounded-full bg-gradient-to-r from-transparent via-red-500 to-transparent animate-pulse" />
+          <div className="w-[45%] h-full rounded-full bg-gradient-to-r from-transparent via-[#ef4444] to-[#f97316] animate-domofon-scan" />
         </div>
       </div>
 

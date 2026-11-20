@@ -875,7 +875,8 @@ async function startServer() {
         type === 'media:frame' ||
         type === 'media:audio' ||
         type === 'media:state' ||
-        type === 'chat:msg'
+        type === 'chat:msg' ||
+        type === 'chat:sync'
       ) {
         if (!client.callId) return;
         const call = activeCalls.get(client.callId);

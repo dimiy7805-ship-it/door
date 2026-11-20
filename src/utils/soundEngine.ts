@@ -42,14 +42,28 @@ class IntercomSoundEngine {
   private muted = false;
   private nextPcmPlayTime = 0;
   private remoteStreamSource: MediaStreamAudioSourceNode | null = null;
+  private remotePresenceFilter: BiquadFilterNode | null = null;
+  private remoteCompressor: DynamicsCompressorNode | null = null;
   private remoteStreamGain: GainNode | null = null;
+  private remoteHtmlAudioEl: HTMLAudioElement | null = null;
 
   public setVoiceCallActive(_active: boolean) {
     // All sounds share the unified Web Audio context stream with call/ring audio
   }
 
   public unlock(): AudioContext | null {
-    return this.getContext();
+    const ctx = this.getContext();
+    if (ctx && ctx.state === 'suspended') {
+      ctx
+        .resume()
+        .then(() => {
+          this.syncRemoteAudioRouting();
+        })
+        .catch(() => {});
+    } else {
+      this.syncRemoteAudioRouting();
+    }
+    return ctx;
   }
 
   private getContext(): AudioContext | null {
@@ -63,33 +77,89 @@ class IntercomSoundEngine {
       }
     }
     if (this.ctx && this.ctx.state === 'suspended') {
-      this.ctx.resume().catch(() => {});
+      this.ctx
+        .resume()
+        .then(() => {
+          this.syncRemoteAudioRouting();
+        })
+        .catch(() => {});
     }
     return this.ctx;
   }
 
-  public attachRemoteWebRtcAudioBackup(stream: MediaStream | null, htmlAudioPlaying: boolean) {
+  private syncRemoteAudioRouting() {
+    if (!this.remoteStreamGain) return;
+    const isRunning = Boolean(this.ctx && this.ctx.state === 'running');
+    if (isRunning) {
+      // Single clean path via WebAudio preamp + compressor (mute HTMLAudioElement to prevent comb-filtering / phase cancellation, while keeping Chrome's WebRTC decoder active!)
+      if (this.remoteHtmlAudioEl) {
+        this.remoteHtmlAudioEl.muted = true;
+      }
+      this.remoteStreamGain.gain.value = 2.25;
+    } else {
+      // AudioContext not yet unlocked by user gesture: play via HTMLAudioElement cleanly until unlocked
+      if (this.remoteHtmlAudioEl) {
+        this.remoteHtmlAudioEl.muted = false;
+        this.remoteHtmlAudioEl.volume = 1.0;
+      }
+      this.remoteStreamGain.gain.value = 0.0;
+    }
+  }
+
+  public attachRemoteWebRtcAudioBackup(
+    stream: MediaStream | null,
+    _htmlAudioPlaying: boolean,
+    audioEl?: HTMLAudioElement | null
+  ) {
     const ctx = this.getContext();
-    if (!ctx) return;
+    this.remoteHtmlAudioEl = stream ? (audioEl ?? this.remoteHtmlAudioEl) : null;
     try {
       if (this.remoteStreamSource) {
         this.remoteStreamSource.disconnect();
         this.remoteStreamSource = null;
       }
+      if (this.remotePresenceFilter) {
+        this.remotePresenceFilter.disconnect();
+        this.remotePresenceFilter = null;
+      }
+      if (this.remoteCompressor) {
+        this.remoteCompressor.disconnect();
+        this.remoteCompressor = null;
+      }
       if (this.remoteStreamGain) {
         this.remoteStreamGain.disconnect();
         this.remoteStreamGain = null;
       }
-      if (!stream || stream.getAudioTracks().length === 0) return;
+      if (!ctx || !stream || stream.getAudioTracks().length === 0) return;
 
       this.remoteStreamSource = ctx.createMediaStreamSource(stream);
+
+      // Gentle high-shelf presence boost (2.4 kHz +4 dB) so consonants, sibilance, and room texture stay crisp and natural
+      this.remotePresenceFilter = ctx.createBiquadFilter();
+      this.remotePresenceFilter.type = 'highshelf';
+      this.remotePresenceFilter.frequency.value = 2400;
+      this.remotePresenceFilter.gain.value = 4.0;
+
+      // Broadcast voice compressor so quiet speech and subtle ambient sounds are clearly audible without clipping
+      this.remoteCompressor = ctx.createDynamicsCompressor();
+      this.remoteCompressor.threshold.value = -28;
+      this.remoteCompressor.knee.value = 18;
+      this.remoteCompressor.ratio.value = 3.5;
+      this.remoteCompressor.attack.value = 0.004;
+      this.remoteCompressor.release.value = 0.16;
+
       this.remoteStreamGain = ctx.createGain();
-      // Only amplify via WebAudio if HTMLAudioElement is blocked/paused by mobile browser policy
-      this.remoteStreamGain.gain.value = htmlAudioPlaying ? 0.0 : 1.35;
-      this.remoteStreamSource.connect(this.remoteStreamGain);
+      this.remoteStreamSource.connect(this.remotePresenceFilter);
+      this.remotePresenceFilter.connect(this.remoteCompressor);
+      this.remoteCompressor.connect(this.remoteStreamGain);
       this.remoteStreamGain.connect(ctx.destination);
+
+      this.syncRemoteAudioRouting();
     } catch {
-      // Ignore if stream has no active audio tracks
+      if (this.remoteHtmlAudioEl) {
+        this.remoteHtmlAudioEl.muted = false;
+        this.remoteHtmlAudioEl.volume = 1.0;
+      }
     }
   }
 
@@ -231,13 +301,21 @@ class IntercomSoundEngine {
 
       const filterNode = ctx.createBiquadFilter();
       filterNode.type = 'lowpass';
-      filterNode.frequency.value = Math.min(5400, safeRate * 0.48);
+      filterNode.frequency.value = Math.min(5600, safeRate * 0.48);
+
+      const compNode = ctx.createDynamicsCompressor();
+      compNode.threshold.value = -24;
+      compNode.knee.value = 18;
+      compNode.ratio.value = 3.2;
+      compNode.attack.value = 0.005;
+      compNode.release.value = 0.14;
 
       const gainNode = ctx.createGain();
-      gainNode.gain.value = 2.15;
+      gainNode.gain.value = 2.4;
 
       source.connect(filterNode);
-      filterNode.connect(gainNode);
+      filterNode.connect(compNode);
+      compNode.connect(gainNode);
       gainNode.connect(ctx.destination);
 
       source.start(this.nextPcmPlayTime);

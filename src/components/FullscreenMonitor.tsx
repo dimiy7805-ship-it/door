@@ -366,7 +366,6 @@ export const FullscreenMonitor: React.FC<FullscreenMonitorProps> = ({
   }, [
     isOpen,
     callState,
-    remoteFrameSeq,
     camEnabled,
     peerCamEnabled,
     showSelfPreview,
