@@ -424,7 +424,7 @@ async function startServer() {
 
       const type = String(msg.type || '');
 
-      if (type === 'ping') {
+      if (type === 'ping' || type === 'wakeup') {
         const c = clientsByWs.get(ws);
         if (c) {
           c.lastSeenAt = Date.now();
@@ -712,6 +712,33 @@ async function startServer() {
         }
 
         if (targetClient.callId && activeCalls.has(targetClient.callId)) {
+          const existingCall = activeCalls.get(targetClient.callId);
+          // Simultaneous-call glare: target is already ringing us right now -> connect both immediately!
+          if (
+            existingCall &&
+            existingCall.status === 'ringing' &&
+            existingCall.callerClientId === targetClient.clientId &&
+            existingCall.calleeClientId === client.clientId
+          ) {
+            existingCall.status = 'connected';
+            client.callId = existingCall.callId;
+            sendJson(targetClient.ws, {
+              type: 'call:connected',
+              callId: existingCall.callId,
+              peerPin: client.pin,
+              initiator: true,
+              mode: existingCall.mode,
+            });
+            sendJson(client.ws, {
+              type: 'call:connected',
+              callId: existingCall.callId,
+              peerPin: targetClient.pin,
+              initiator: false,
+              mode: existingCall.mode,
+            });
+            broadcastPresence();
+            return;
+          }
           sendJson(ws, {
             type: 'call:status',
             status: 'busy',
@@ -875,6 +902,7 @@ async function startServer() {
         type === 'media:frame' ||
         type === 'media:audio' ||
         type === 'media:state' ||
+        type === 'media:resync' ||
         type === 'chat:msg' ||
         type === 'chat:sync'
       ) {

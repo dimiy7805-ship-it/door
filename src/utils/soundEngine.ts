@@ -1,4 +1,8 @@
-import { BRAND_SPECS, IntercomBrand } from './intercomLogic';
+import {
+  BRAND_SPECS,
+  IntercomBrand,
+  evaluateAdaptiveNoiseGate,
+} from './intercomLogic';
 
 export interface ToneStep {
   freq: number;
@@ -42,14 +46,29 @@ class IntercomSoundEngine {
   private muted = false;
   private nextPcmPlayTime = 0;
   private remoteStreamSource: MediaStreamAudioSourceNode | null = null;
+  private remoteAnalyser: AnalyserNode | null = null;
+  private remoteGateGain: GainNode | null = null;
   private remotePresenceFilter: BiquadFilterNode | null = null;
   private remoteHissCutFilter: BiquadFilterNode | null = null;
   private remoteCompressor: DynamicsCompressorNode | null = null;
   private remoteStreamGain: GainNode | null = null;
   private remoteHtmlAudioEl: HTMLAudioElement | null = null;
+  private remotePeerMuted = false;
+  private remoteGateTimer: number | null = null;
+  private remoteNoiseFloorRms = 0;
+  private remoteStationarySeconds = 0;
 
   public setVoiceCallActive(_active: boolean) {
     // All sounds share the unified Web Audio context stream with call/ring audio
+  }
+
+  public setRemotePeerMuted(muted: boolean) {
+    this.remotePeerMuted = muted;
+    this.syncRemoteAudioRouting();
+    if (this.remoteGateGain && this.ctx) {
+      const now = this.ctx.currentTime;
+      this.remoteGateGain.gain.setTargetAtTime(muted ? 0.0 : 1.0, now, 0.025);
+    }
   }
 
   public unlock(): AudioContext | null {
@@ -88,21 +107,30 @@ class IntercomSoundEngine {
     return this.ctx;
   }
 
+  private stopRemoteGateMonitor() {
+    if (this.remoteGateTimer !== null) {
+      window.clearInterval(this.remoteGateTimer);
+      this.remoteGateTimer = null;
+    }
+    this.remoteNoiseFloorRms = 0;
+    this.remoteStationarySeconds = 0;
+  }
+
   private syncRemoteAudioRouting() {
     if (!this.remoteStreamGain) return;
     const isRunning = Boolean(this.ctx && this.ctx.state === 'running');
     if (isRunning) {
-      // Single clean path via WebAudio vocal EQ + anti-hiss lowpass + gentle compressor
+      // Single clean path via WebAudio vocal EQ + anti-hiss lowpass + adaptive white-noise gate
       // (mute HTMLAudioElement to prevent comb-filtering / phase cancellation while keeping Chrome's WebRTC decoder active)
       if (this.remoteHtmlAudioEl) {
         this.remoteHtmlAudioEl.muted = true;
       }
-      this.remoteStreamGain.gain.value = 1.5;
+      this.remoteStreamGain.gain.value = this.remotePeerMuted ? 0.0 : 1.28;
     } else {
       // AudioContext not yet unlocked by user gesture: play via HTMLAudioElement cleanly until unlocked
       if (this.remoteHtmlAudioEl) {
-        this.remoteHtmlAudioEl.muted = false;
-        this.remoteHtmlAudioEl.volume = 1.0;
+        this.remoteHtmlAudioEl.muted = this.remotePeerMuted;
+        this.remoteHtmlAudioEl.volume = this.remotePeerMuted ? 0.0 : 1.0;
       }
       this.remoteStreamGain.gain.value = 0.0;
     }
@@ -114,11 +142,24 @@ class IntercomSoundEngine {
     audioEl?: HTMLAudioElement | null
   ) {
     const ctx = this.getContext();
+    this.stopRemoteGateMonitor();
+    if (!stream && this.remoteHtmlAudioEl) {
+      this.remoteHtmlAudioEl.muted = false;
+      this.remoteHtmlAudioEl.volume = 1.0;
+    }
     this.remoteHtmlAudioEl = stream ? (audioEl ?? this.remoteHtmlAudioEl) : null;
     try {
       if (this.remoteStreamSource) {
         this.remoteStreamSource.disconnect();
         this.remoteStreamSource = null;
+      }
+      if (this.remoteAnalyser) {
+        this.remoteAnalyser.disconnect();
+        this.remoteAnalyser = null;
+      }
+      if (this.remoteGateGain) {
+        this.remoteGateGain.disconnect();
+        this.remoteGateGain = null;
       }
       if (this.remotePresenceFilter) {
         this.remotePresenceFilter.disconnect();
@@ -140,39 +181,99 @@ class IntercomSoundEngine {
 
       this.remoteStreamSource = ctx.createMediaStreamSource(stream);
 
-      // Gentle mid-range vocal clarity boost (1.8 kHz +1.8 dB) without boosting high-frequency mic hiss
+      this.remoteAnalyser = ctx.createAnalyser();
+      this.remoteAnalyser.fftSize = 512;
+      this.remoteAnalyser.smoothingTimeConstant = 0.35;
+
+      this.remoteGateGain = ctx.createGain();
+      this.remoteGateGain.gain.value = this.remotePeerMuted ? 0.0 : 1.0;
+
+      // Gentle mid-range vocal clarity boost (1.8 kHz +1.6 dB) without boosting high-frequency mic hiss
       this.remotePresenceFilter = ctx.createBiquadFilter();
       this.remotePresenceFilter.type = 'peaking';
       this.remotePresenceFilter.frequency.value = 1800;
       this.remotePresenceFilter.Q.value = 0.9;
-      this.remotePresenceFilter.gain.value = 1.8;
+      this.remotePresenceFilter.gain.value = 1.6;
 
-      // Soft anti-hiss lowpass rolloff above 7.2 kHz to suppress broadband white noise
+      // Soft anti-hiss lowpass rolloff above 6.8 kHz to suppress broadband white noise
       this.remoteHissCutFilter = ctx.createBiquadFilter();
       this.remoteHissCutFilter.type = 'lowpass';
-      this.remoteHissCutFilter.frequency.value = 7200;
+      this.remoteHissCutFilter.frequency.value = 6800;
       this.remoteHissCutFilter.Q.value = 0.7;
 
       // Balanced voice compressor so speech stays clear and loud without pumping up silence/background hiss
       this.remoteCompressor = ctx.createDynamicsCompressor();
       this.remoteCompressor.threshold.value = -20;
       this.remoteCompressor.knee.value = 12;
-      this.remoteCompressor.ratio.value = 2.2;
+      this.remoteCompressor.ratio.value = 2.0;
       this.remoteCompressor.attack.value = 0.008;
       this.remoteCompressor.release.value = 0.18;
 
       this.remoteStreamGain = ctx.createGain();
-      this.remoteStreamSource.connect(this.remotePresenceFilter);
+      this.remoteStreamSource.connect(this.remoteAnalyser);
+      this.remoteAnalyser.connect(this.remoteGateGain);
+      this.remoteGateGain.connect(this.remotePresenceFilter);
       this.remotePresenceFilter.connect(this.remoteHissCutFilter);
       this.remoteHissCutFilter.connect(this.remoteCompressor);
       this.remoteCompressor.connect(this.remoteStreamGain);
       this.remoteStreamGain.connect(ctx.destination);
 
       this.syncRemoteAudioRouting();
+
+      // Lightweight 40ms adaptive spectral gate: silences unplugged PC audio jack white noise while keeping real speech & rustling intact
+      const timeData = new Float32Array(this.remoteAnalyser.fftSize);
+      const freqData = new Uint8Array(this.remoteAnalyser.frequencyBinCount);
+      const binHz = (ctx.sampleRate || 48000) / this.remoteAnalyser.fftSize;
+      const vocalStartBin = Math.max(1, Math.floor(150 / binHz));
+      const vocalEndBin = Math.min(freqData.length - 1, Math.ceil(2500 / binHz));
+      const highStartBin = Math.min(freqData.length - 1, Math.floor(3500 / binHz));
+      const highEndBin = Math.min(freqData.length - 1, Math.ceil(7500 / binHz));
+
+      this.remoteGateTimer = window.setInterval(() => {
+        if (!this.remoteAnalyser || !this.remoteGateGain || !this.ctx) return;
+        if (this.ctx.state !== 'running') return;
+        this.remoteAnalyser.getFloatTimeDomainData(timeData);
+        let sumSq = 0;
+        for (let i = 0; i < timeData.length; i++) {
+          sumSq += timeData[i] * timeData[i];
+        }
+        const rms = Math.sqrt(sumSq / timeData.length);
+
+        this.remoteAnalyser.getByteFrequencyData(freqData);
+        let vocalSum = 0;
+        for (let b = vocalStartBin; b <= vocalEndBin; b++) {
+          vocalSum += freqData[b];
+        }
+        const vocalEnergy = vocalSum / Math.max(1, vocalEndBin - vocalStartBin + 1) / 255;
+
+        let highSum = 0;
+        for (let b = highStartBin; b <= highEndBin; b++) {
+          highSum += freqData[b];
+        }
+        const highBandEnergy = highSum / Math.max(1, highEndBin - highStartBin + 1) / 255;
+
+        const gateRes = evaluateAdaptiveNoiseGate({
+          rms,
+          vocalEnergy,
+          highBandEnergy,
+          noiseFloorRms: this.remoteNoiseFloorRms,
+          stationarySeconds: this.remoteStationarySeconds,
+          dtSec: 0.04,
+          peerMuted: this.remotePeerMuted,
+        });
+        this.remoteNoiseFloorRms = gateRes.nextNoiseFloorRms;
+        this.remoteStationarySeconds = gateRes.nextStationarySeconds;
+
+        const now = this.ctx.currentTime;
+        const currentTarget = gateRes.targetGain;
+        // Fast 15ms attack so first syllable of speech is never clipped, smooth 180ms release for hiss fade-out
+        const timeConst = currentTarget > this.remoteGateGain.gain.value ? 0.015 : 0.18;
+        this.remoteGateGain.gain.setTargetAtTime(currentTarget, now, timeConst);
+      }, 40);
     } catch {
       if (this.remoteHtmlAudioEl) {
-        this.remoteHtmlAudioEl.muted = false;
-        this.remoteHtmlAudioEl.volume = 1.0;
+        this.remoteHtmlAudioEl.muted = this.remotePeerMuted;
+        this.remoteHtmlAudioEl.volume = this.remotePeerMuted ? 0.0 : 1.0;
       }
     }
   }
@@ -287,10 +388,21 @@ class IntercomSoundEngine {
   }
 
   private scheduleFloat32Samples(samples: Float32Array, sampleRate: number) {
+    if (this.remotePeerMuted) return;
     const ctx = this.getContext();
     if (!ctx || samples.length === 0) return;
 
     try {
+      // Compute chunk RMS so pure silence / 8-bit quantization hiss is cleanly muted (0.0 instead of 0.15!)
+      let sumSq = 0;
+      for (let i = 0; i < samples.length; i++) {
+        sumSq += samples[i] * samples[i];
+      }
+      const rms = Math.sqrt(sumSq / samples.length);
+      if (rms < 0.0025) {
+        return;
+      }
+
       const safeRate = Math.max(4000, Math.min(48000, sampleRate || 10000));
       const buffer = ctx.createBuffer(1, samples.length, safeRate);
       const channel = buffer.getChannelData(0);
@@ -302,14 +414,8 @@ class IntercomSoundEngine {
         this.nextPcmPlayTime = now + 0.065;
       }
 
-      // Compute chunk RMS so pure 8-bit quantization hiss during silence is smoothly attenuated
-      let sumSq = 0;
-      for (let i = 0; i < samples.length; i++) {
-        sumSq += samples[i] * samples[i];
-      }
-      const rms = Math.sqrt(sumSq / samples.length);
       const noiseExpanderGain =
-        rms < 0.012 ? 0.15 + 0.85 * Math.pow(rms / 0.012, 2) : 1.0;
+        rms < 0.012 ? Math.pow((rms - 0.0025) / 0.0095, 1.8) : 1.0;
 
       // Only apply a short ramp at the start of a new burst after an underrun
       const fadeInLen = isUnderrun ? Math.min(24, Math.floor(samples.length / 8)) : 0;
@@ -329,12 +435,12 @@ class IntercomSoundEngine {
       const compNode = ctx.createDynamicsCompressor();
       compNode.threshold.value = -18;
       compNode.knee.value = 12;
-      compNode.ratio.value = 2.2;
+      compNode.ratio.value = 2.0;
       compNode.attack.value = 0.008;
       compNode.release.value = 0.16;
 
       const gainNode = ctx.createGain();
-      gainNode.gain.value = 1.55;
+      gainNode.gain.value = 1.35;
 
       source.connect(filterNode);
       filterNode.connect(compNode);

@@ -9,6 +9,7 @@ import {
   formatIntercomDisplay,
   resolveKeypadPress,
   sanitizeChatMessage,
+  shouldAcceptVideoFrame,
 } from './utils/intercomLogic';
 import { encodePcm8Base64, soundEngine } from './utils/soundEngine';
 import { IntercomScene3D } from './components/IntercomScene3D';
@@ -26,7 +27,7 @@ const RTC_CONFIG: RTCConfiguration = {
     { urls: 'stun:stun.cloudflare.com:3478' },
     { urls: 'stun:stun.nextcloud.com:443' },
   ],
-  iceCandidatePoolSize: 4,
+  iceCandidatePoolSize: 0,
 };
 
 function filterExtraCandidates(
@@ -236,7 +237,6 @@ export default function App() {
   const [pressedKeyTrigger, setPressedKeyTrigger] = useState<{ key: string; seq: number } | null>(
     null
   );
-  const [remoteFrameSeq, setRemoteFrameSeq] = useState<number>(0);
   const [isHardwareCam, setIsHardwareCam] = useState<boolean>(false);
   const [isSceneReady, setIsSceneReady] = useState<boolean>(false);
 
@@ -270,8 +270,12 @@ export default function App() {
   const trickleIceBatchRef = useRef<RTCIceCandidateInit[]>([]);
   const trickleIceFlushTimerRef = useRef<number | null>(null);
   const lastMediaStateAckAtRef = useRef<number>(0);
+  const remoteFrameVersionRef = useRef<number>(0);
+  const outboundStreamEpochRef = useRef<number>((Date.now() & 0xffffff) || 1);
   const outboundFrameSeqRef = useRef<number>(0);
+  const lastReceivedFrameEpochRef = useRef<number>(0);
   const lastReceivedFrameSeqRef = useRef<number>(0);
+  const lastDrawnFrameEpochRef = useRef<number>(0);
   const lastDrawnFrameSeqRef = useRef<number>(0);
   const webrtcOfferRetryTimerRef = useRef<number | null>(null);
   const iceRestartTimerRef = useRef<number | null>(null);
@@ -289,6 +293,11 @@ export default function App() {
   camEnabledRef.current = camEnabled;
   const micEnabledRef = useRef(micEnabled);
   micEnabledRef.current = micEnabled;
+  const peerCamEnabledRef = useRef(peerCamEnabled);
+  peerCamEnabledRef.current = peerCamEnabled;
+  const peerMicEnabledRef = useRef(peerMicEnabled);
+  peerMicEnabledRef.current = peerMicEnabled;
+  const peerHasMicRef = useRef<boolean>(true);
   const facingModeRef = useRef(cameraFacingMode);
   facingModeRef.current = cameraFacingMode;
   const isChatOpenRef = useRef(isChatOpen);
@@ -298,46 +307,62 @@ export default function App() {
   const chatMessagesRef = useRef(chatMessages);
   chatMessagesRef.current = chatMessages;
 
-  const drawFrameToRemoteCanvas = useCallback((frameDataUrl: string, frameSeq?: number) => {
-    if (!frameDataUrl) return;
-    if (typeof frameSeq === 'number' && frameSeq > 0) {
-      if (frameSeq <= lastReceivedFrameSeqRef.current) return;
-      lastReceivedFrameSeqRef.current = frameSeq;
-    }
-    try {
-      sessionStorage.setItem('intercom_last_peer_frame', frameDataUrl);
-    } catch {
-      // Ignore quota errors
-    }
-    const img = new Image();
-    img.onload = () => {
-      if (typeof frameSeq === 'number' && frameSeq > 0) {
-        if (frameSeq < lastDrawnFrameSeqRef.current) return;
-        lastDrawnFrameSeqRef.current = frameSeq;
+  const drawFrameToRemoteCanvas = useCallback(
+    (frameDataUrl: string, frameSeq?: number, frameEpoch?: number) => {
+      if (!frameDataUrl) return;
+      const rxGate = shouldAcceptVideoFrame(
+        frameEpoch,
+        frameSeq,
+        lastReceivedFrameEpochRef.current,
+        lastReceivedFrameSeqRef.current
+      );
+      if (!rxGate.accept) return;
+      lastReceivedFrameEpochRef.current = rxGate.nextEpoch;
+      lastReceivedFrameSeqRef.current = rxGate.nextSeq;
+
+      try {
+        sessionStorage.setItem('intercom_last_peer_frame', frameDataUrl);
+      } catch {
+        // Ignore quota errors
       }
-      const remCanvas = remoteCanvasDisplayRef.current;
-      if (!remCanvas) return;
-      const iw = img.naturalWidth || 480;
-      const ih = img.naturalHeight || 360;
-      if (baselinePeerIsPortraitRef.current === null && iw > 0 && ih > 0 && iw !== ih) {
-        const isPortrait = ih > iw;
-        baselinePeerIsPortraitRef.current = isPortrait;
-        setBaselinePeerIsPortrait(isPortrait);
-      }
-      if (remCanvas.width !== iw || remCanvas.height !== ih) {
-        remCanvas.width = iw;
-        remCanvas.height = ih;
-      }
-      const ctx = remCanvas.getContext('2d');
-      if (ctx) {
-        ctx.imageSmoothingEnabled = true;
-        ctx.imageSmoothingQuality = 'high';
-        ctx.drawImage(img, 0, 0, iw, ih);
-        setRemoteFrameSeq((s) => s + 1);
-      }
-    };
-    img.src = frameDataUrl;
-  }, []);
+      const img = new Image();
+      img.onload = () => {
+        const drawGate = shouldAcceptVideoFrame(
+          frameEpoch,
+          frameSeq,
+          lastDrawnFrameEpochRef.current,
+          lastDrawnFrameSeqRef.current
+        );
+        if (!drawGate.accept) return;
+        lastDrawnFrameEpochRef.current = drawGate.nextEpoch;
+        lastDrawnFrameSeqRef.current = drawGate.nextSeq;
+
+        const remCanvas = remoteCanvasDisplayRef.current;
+        if (!remCanvas) return;
+        const iw = img.naturalWidth || 480;
+        const ih = img.naturalHeight || 360;
+        if (baselinePeerIsPortraitRef.current === null && iw > 0 && ih > 0 && iw !== ih) {
+          const isPortrait = ih > iw;
+          baselinePeerIsPortraitRef.current = isPortrait;
+          setBaselinePeerIsPortrait(isPortrait);
+        }
+        if (remCanvas.width !== iw || remCanvas.height !== ih) {
+          remCanvas.width = iw;
+          remCanvas.height = ih;
+        }
+        const ctx = remCanvas.getContext('2d');
+        if (ctx) {
+          ctx.imageSmoothingEnabled = true;
+          ctx.imageSmoothingQuality = 'medium';
+          ctx.drawImage(img, 0, 0, iw, ih);
+          // Mutate ref in-place instead of setState so incoming video frames trigger ZERO React re-renders!
+          remoteFrameVersionRef.current += 1;
+        }
+      };
+      img.src = frameDataUrl;
+    },
+    []
+  );
 
   const resetCallChat = useCallback((clearStoredHistory = true) => {
     if (clearStoredHistory && activeCallIdRef.current) {
@@ -398,18 +423,23 @@ export default function App() {
   }, []);
 
   const ensureLocalMedia = useCallback(
-    async (forceFacingMode?: 'user' | 'environment'): Promise<MediaStream | null> => {
-      if (!forceFacingMode && mediaInitPromiseRef.current) {
+    async (
+      forceFacingMode?: 'user' | 'environment',
+      forceVideoReacquire = false
+    ): Promise<MediaStream | null> => {
+      if (!forceFacingMode && !forceVideoReacquire && mediaInitPromiseRef.current) {
         return mediaInitPromiseRef.current;
       }
 
       const targetFacing = forceFacingMode || facingModeRef.current;
 
       const existing = localStreamRef.current;
+      const existingVidTrack = existing?.getVideoTracks()[0] || null;
       const hasLiveVideo = Boolean(
-        existing &&
+        existingVidTrack &&
           hasHardwareVideoRef.current &&
-          existing.getVideoTracks().some((t) => t.readyState === 'live')
+          existingVidTrack.readyState === 'live' &&
+          !existingVidTrack.muted
       );
       const hasLiveAudio = Boolean(
         existing &&
@@ -417,18 +447,32 @@ export default function App() {
           existing.getAudioTracks().some((t) => t.readyState === 'live')
       );
 
-      if (existing && !forceFacingMode) {
-        if ((hasLiveVideo && hasLiveAudio) || existing.getTracks().some((t) => t.readyState === 'live')) {
-          if (localVideoRef.current && localVideoRef.current.srcObject !== existing) {
-            localVideoRef.current.srcObject = existing;
-            localVideoRef.current.play().catch(() => {});
-          }
-          return existing;
+      // Ensure local <video> playback resumes after iOS/Android background switch (e.g. returning from Telegram)
+      if (existing && localVideoRef.current) {
+        if (localVideoRef.current.srcObject !== existing) {
+          localVideoRef.current.srcObject = existing;
         }
-        // Throttle hardware re-acquisition attempts to once every 1.8s
-        if (Date.now() - lastMediaRetryAtRef.current < 1800) {
-          return existing;
+        if (localVideoRef.current.paused) {
+          localVideoRef.current.muted = true;
+          localVideoRef.current.play().catch(() => {});
         }
+      }
+
+      const needVideo = camEnabledRef.current && (!hasLiveVideo || forceVideoReacquire);
+      const needAudio = !hasLiveAudio;
+
+      if (existing && !forceFacingMode && !needVideo && !needAudio) {
+        return existing;
+      }
+
+      // Throttle hardware re-acquisition attempts when partial media already exists
+      if (
+        existing &&
+        !forceFacingMode &&
+        !forceVideoReacquire &&
+        Date.now() - lastMediaRetryAtRef.current < 2600
+      ) {
+        return existing;
       }
 
       lastMediaRetryAtRef.current = Date.now();
@@ -438,193 +482,285 @@ export default function App() {
       }
 
       const task = (async (): Promise<MediaStream | null> => {
-      let acquiredVideoTrack: MediaStreamTrack | null =
-        !forceFacingMode && hasLiveVideo && existing ? existing.getVideoTracks()[0] || null : null;
-      let acquiredAudioTrack: MediaStreamTrack | null =
-        hasLiveAudio && existing ? existing.getAudioTracks()[0] || null : null;
+        let acquiredVideoTrack: MediaStreamTrack | null =
+          !forceFacingMode && !forceVideoReacquire && hasLiveVideo && existingVidTrack
+            ? existingVidTrack
+            : null;
+        let acquiredAudioTrack: MediaStreamTrack | null =
+          hasLiveAudio && existing ? existing.getAudioTracks()[0] || null : null;
 
-      if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-        // 1. Try combined audio + video with preferred camera facingMode at crisp 640x480 @ 30fps
-        if (!acquiredVideoTrack || !acquiredAudioTrack || forceFacingMode) {
+        if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+          // Check enumerateDevices first so PCs with NO hardware mic or camera skip futile getUserMedia retries
+          let hardwareHasAudio = true;
+          let hardwareHasVideo = true;
           try {
-            const combined = await navigator.mediaDevices.getUserMedia({
-              video: {
-                facingMode: { ideal: targetFacing },
-                width: { ideal: 640 },
-                height: { ideal: 480 },
-                frameRate: { ideal: 30 },
-              },
-              audio: {
-                echoCancellation: true,
-                noiseSuppression: true,
-                autoGainControl: true,
-                sampleRate: { ideal: 48000 },
-              },
-            });
-            if (combined.getVideoTracks()[0]) {
-              acquiredVideoTrack = combined.getVideoTracks()[0];
-              hasHardwareVideoRef.current = true;
-            }
-            if (combined.getAudioTracks()[0]) {
-              acquiredAudioTrack = combined.getAudioTracks()[0];
-              hasHardwareAudioRef.current = true;
+            if (typeof navigator.mediaDevices.enumerateDevices === 'function') {
+              const devices = await navigator.mediaDevices.enumerateDevices();
+              if (devices.length > 0) {
+                hardwareHasAudio = devices.some((d) => d.kind === 'audioinput');
+                hardwareHasVideo = devices.some((d) => d.kind === 'videoinput');
+              }
             }
           } catch {
-            // 2. Try unconstrained video + audio (fixes mobile devices that reject width/height constraints)
+            // Keep optimistic true if enumerateDevices is blocked
+          }
+
+          // 1. If both are needed and hardware exists, try combined audio + video first
+          if (
+            ((!acquiredVideoTrack && hardwareHasVideo) && (!acquiredAudioTrack && hardwareHasAudio)) ||
+            (forceFacingMode && hardwareHasVideo)
+          ) {
             try {
-              const basic = await navigator.mediaDevices.getUserMedia({
-                video: true,
-                audio: true,
+              const combined = await navigator.mediaDevices.getUserMedia({
+                video: {
+                  facingMode: { ideal: targetFacing },
+                  width: { ideal: 640 },
+                  height: { ideal: 480 },
+                  frameRate: { ideal: 30 },
+                },
+                audio:
+                  acquiredAudioTrack || !hardwareHasAudio
+                    ? false
+                    : {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true,
+                      },
               });
-              if (basic.getVideoTracks()[0]) {
-                acquiredVideoTrack = basic.getVideoTracks()[0];
+              if (combined.getVideoTracks()[0]) {
+                acquiredVideoTrack = combined.getVideoTracks()[0];
                 hasHardwareVideoRef.current = true;
               }
-              if (basic.getAudioTracks()[0]) {
-                acquiredAudioTrack = basic.getAudioTracks()[0];
+              if (combined.getAudioTracks()[0]) {
+                acquiredAudioTrack = combined.getAudioTracks()[0];
                 hasHardwareAudioRef.current = true;
               }
             } catch {
-              // 3. Try acquiring microphone and camera independently so one never blocks the other
-              if (!acquiredAudioTrack) {
-                try {
-                  const audioOnly = await navigator.mediaDevices.getUserMedia({
-                    audio: {
-                      echoCancellation: true,
-                      noiseSuppression: true,
-                      autoGainControl: true,
-                      sampleRate: { ideal: 48000 },
-                    },
-                    video: false,
-                  });
-                  if (audioOnly.getAudioTracks()[0]) {
-                    acquiredAudioTrack = audioOnly.getAudioTracks()[0];
-                    hasHardwareAudioRef.current = true;
-                  }
-                } catch {
-                  // Ignore
+              // 2. Unconstrained combined request (fixes laptops/USB webcams & mobile devices rejecting ideal caps)
+              try {
+                const basic = await navigator.mediaDevices.getUserMedia({
+                  video: hardwareHasVideo,
+                  audio: !acquiredAudioTrack && hardwareHasAudio,
+                });
+                if (basic.getVideoTracks()[0]) {
+                  acquiredVideoTrack = basic.getVideoTracks()[0];
+                  hasHardwareVideoRef.current = true;
                 }
-              }
-              if (!acquiredVideoTrack || forceFacingMode) {
-                try {
-                  const videoOnly = await navigator.mediaDevices.getUserMedia({
-                    video: { facingMode: { ideal: targetFacing } },
-                    audio: false,
-                  });
-                  if (videoOnly.getVideoTracks()[0]) {
-                    acquiredVideoTrack = videoOnly.getVideoTracks()[0];
-                    hasHardwareVideoRef.current = true;
-                  }
-                } catch {
-                  // Ignore
+                if (basic.getAudioTracks()[0]) {
+                  acquiredAudioTrack = basic.getAudioTracks()[0];
+                  hasHardwareAudioRef.current = true;
                 }
+              } catch {
+                // Fall through to independent audio & video grabs below
               }
             }
           }
-        }
-      }
 
-      if (acquiredVideoTrack) {
-        acquiredVideoTrack.enabled = camEnabledRef.current;
-        setIsHardwareCam(true);
-      }
-      if (acquiredAudioTrack) {
-        acquiredAudioTrack.enabled = micEnabledRef.current;
-      }
-
-      // If hardware video was acquired or audio was acquired, build/update the unified MediaStream
-      const finalStream = new MediaStream();
-      if (acquiredAudioTrack) {
-        finalStream.addTrack(acquiredAudioTrack);
-      }
-
-      if (acquiredVideoTrack) {
-        finalStream.addTrack(acquiredVideoTrack);
-      } else {
-        // Fallback synthetic video track if camera hardware is absent or denied
-        try {
-          const fallbackCanvas = document.createElement('canvas');
-          fallbackCanvas.width = 480;
-          fallbackCanvas.height = 360;
-          const ctx = fallbackCanvas.getContext('2d');
-          const drawFallback = () => {
-            if (!ctx) return;
-            const grad = ctx.createRadialGradient(240, 155, 20, 240, 180, 260);
-            grad.addColorStop(0, '#222834');
-            grad.addColorStop(1, '#101318');
-            ctx.fillStyle = grad;
-            ctx.fillRect(0, 0, 480, 360);
-
-            ctx.fillStyle = '#333b4a';
-            ctx.beginPath();
-            ctx.arc(240, 125, 44, 0, Math.PI * 2);
-            ctx.fill();
-
-            ctx.beginPath();
-            ctx.ellipse(240, 255, 92, 68, 0, Math.PI, 0, false);
-            ctx.fill();
-
-            ctx.strokeStyle = 'rgba(255,255,255,0.12)';
-            ctx.lineWidth = 1.5;
-            ctx.strokeRect(168, 64, 144, 144);
-          };
-          drawFallback();
-          window.setInterval(drawFallback, 250);
-
-          if (typeof fallbackCanvas.captureStream === 'function') {
-            const canvasStream = fallbackCanvas.captureStream(20);
-            const fallbackVidTrack = canvasStream.getVideoTracks()[0];
-            if (fallbackVidTrack) {
-              finalStream.addTrack(fallbackVidTrack);
-            }
-          }
-        } catch {
-          // Ignore
-        }
-      }
-
-      // Stop any replaced tracks from the previous stream
-      if (existing && existing !== finalStream) {
-        const newIds = new Set(finalStream.getTracks().map((t) => t.id));
-        existing.getTracks().forEach((t) => {
-          if (!newIds.has(t.id)) {
+          // 3. Acquire microphone independently if still missing and hardware audio input exists
+          if (!acquiredAudioTrack && hardwareHasAudio) {
             try {
-              t.stop();
-            } catch {
-              // Ignore
-            }
-          }
-        });
-      }
-
-      localStreamRef.current = finalStream;
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = finalStream;
-        localVideoRef.current.muted = true;
-        localVideoRef.current.play().catch(() => {});
-      }
-
-      // If an RTCPeerConnection is already active, make sure newly acquired tracks are attached/replaced
-      const pc = pcRef.current;
-      if (pc && pc.signalingState !== 'closed') {
-        try {
-          const senders = pc.getSenders();
-          for (const track of finalStream.getTracks()) {
-            const matchingSender = senders.find((s) => s.track && s.track.kind === track.kind);
-            if (matchingSender) {
-              if (matchingSender.track?.id !== track.id) {
-                matchingSender.replaceTrack(track).catch(() => {});
+              const audioOnly = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                  echoCancellation: true,
+                  noiseSuppression: true,
+                  autoGainControl: true,
+                },
+                video: false,
+              });
+              if (audioOnly.getAudioTracks()[0]) {
+                acquiredAudioTrack = audioOnly.getAudioTracks()[0];
+                hasHardwareAudioRef.current = true;
               }
-            } else {
-              pc.addTrack(track, finalStream);
+            } catch {
+              try {
+                const rawAudio = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+                if (rawAudio.getAudioTracks()[0]) {
+                  acquiredAudioTrack = rawAudio.getAudioTracks()[0];
+                  hasHardwareAudioRef.current = true;
+                }
+              } catch {
+                // Ignore
+              }
             }
           }
-        } catch {
-          // Ignore
-        }
-      }
 
-      return finalStream;
+          // 4. Acquire camera independently if still missing and hardware video input exists
+          if (!acquiredVideoTrack && camEnabledRef.current && hardwareHasVideo) {
+            try {
+              const videoFacing = await navigator.mediaDevices.getUserMedia({
+                video: { facingMode: { ideal: targetFacing } },
+                audio: false,
+              });
+              if (videoFacing.getVideoTracks()[0]) {
+                acquiredVideoTrack = videoFacing.getVideoTracks()[0];
+                hasHardwareVideoRef.current = true;
+              }
+            } catch {
+              // Final pure { video: true } fallback for laptop/desktop USB webcams without facingMode support
+              try {
+                const rawVideo = await navigator.mediaDevices.getUserMedia({
+                  video: true,
+                  audio: false,
+                });
+                if (rawVideo.getVideoTracks()[0]) {
+                  acquiredVideoTrack = rawVideo.getVideoTracks()[0];
+                  hasHardwareVideoRef.current = true;
+                }
+              } catch {
+                // Ignore
+              }
+            }
+          }
+        }
+
+        if (acquiredVideoTrack) {
+          acquiredVideoTrack.enabled = camEnabledRef.current;
+          acquiredVideoTrack.onended = () => {
+            hasHardwareVideoRef.current = false;
+          };
+          setIsHardwareCam(true);
+        }
+        if (acquiredAudioTrack) {
+          acquiredAudioTrack.enabled = micEnabledRef.current;
+          acquiredAudioTrack.onended = () => {
+            hasHardwareAudioRef.current = false;
+          };
+        }
+
+        // Build unified MediaStream
+        const finalStream = new MediaStream();
+        if (acquiredAudioTrack) {
+          finalStream.addTrack(acquiredAudioTrack);
+        }
+
+        if (acquiredVideoTrack) {
+          finalStream.addTrack(acquiredVideoTrack);
+        } else {
+          // Fallback synthetic video track if camera hardware is absent or denied
+          try {
+            const fallbackCanvas = document.createElement('canvas');
+            fallbackCanvas.width = 480;
+            fallbackCanvas.height = 360;
+            const ctx = fallbackCanvas.getContext('2d');
+            if (ctx) {
+              const grad = ctx.createRadialGradient(240, 155, 20, 240, 180, 260);
+              grad.addColorStop(0, '#222834');
+              grad.addColorStop(1, '#101318');
+              ctx.fillStyle = grad;
+              ctx.fillRect(0, 0, 480, 360);
+
+              ctx.fillStyle = '#333b4a';
+              ctx.beginPath();
+              ctx.arc(240, 125, 44, 0, Math.PI * 2);
+              ctx.fill();
+
+              ctx.beginPath();
+              ctx.ellipse(240, 255, 92, 68, 0, Math.PI, 0, false);
+              ctx.fill();
+
+              ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+              ctx.lineWidth = 1.5;
+              ctx.strokeRect(168, 64, 144, 144);
+            }
+            if (typeof fallbackCanvas.captureStream === 'function') {
+              const canvasStream = fallbackCanvas.captureStream(10);
+              const fallbackVidTrack = canvasStream.getVideoTracks()[0];
+              if (fallbackVidTrack) {
+                finalStream.addTrack(fallbackVidTrack);
+              }
+            }
+          } catch {
+            // Ignore
+          }
+        }
+
+        // Stop any replaced tracks from the previous stream
+        if (existing && existing !== finalStream) {
+          const newIds = new Set(finalStream.getTracks().map((t) => t.id));
+          existing.getTracks().forEach((t) => {
+            if (!newIds.has(t.id)) {
+              try {
+                t.stop();
+              } catch {
+                // Ignore
+              }
+            }
+          });
+        }
+
+        localStreamRef.current = finalStream;
+        if (localVideoRef.current) {
+          localVideoRef.current.srcObject = finalStream;
+          localVideoRef.current.muted = true;
+          localVideoRef.current.play().catch(() => {});
+        }
+
+        // Bump outbound stream epoch whenever video track changes so fallback frames never clash with older seq numbers
+        if (acquiredVideoTrack && (!existingVidTrack || existingVidTrack.id !== acquiredVideoTrack.id)) {
+          outboundStreamEpochRef.current = Math.max(
+            outboundStreamEpochRef.current + 1,
+            (Date.now() & 0xffffff) || 1
+          );
+          outboundFrameSeqRef.current = 0;
+        }
+
+        // Attach/replace newly acquired tracks on active RTCPeerConnection
+        const pc = pcRef.current;
+        if (pc && pc.signalingState !== 'closed') {
+          try {
+            const senders = pc.getSenders();
+            let addedNewSender = false;
+            for (const track of finalStream.getTracks()) {
+              const matchingSender = senders.find(
+                (s) =>
+                  (s.track && s.track.kind === track.kind) ||
+                  (!s.track &&
+                    pc
+                      .getTransceivers()
+                      .some((tr) => tr.sender === s && tr.receiver.track?.kind === track.kind))
+              );
+              if (matchingSender) {
+                if (matchingSender.track?.id !== track.id) {
+                  await matchingSender.replaceTrack(track).catch(() => {});
+                }
+              } else {
+                pc.addTrack(track, finalStream);
+                addedNewSender = true;
+              }
+            }
+            // If a brand-new video/audio sender was added mid-call, renegotiate immediately so remote peer receives it
+            if (addedNewSender && pc.signalingState === 'stable') {
+              try {
+                const offer = await pc.createOffer({
+                  offerToReceiveAudio: true,
+                  offerToReceiveVideo: true,
+                });
+                await pc.setLocalDescription(offer);
+                sendWs({
+                  type: 'webrtc:offer',
+                  sdp: pc.localDescription,
+                });
+              } catch {
+                // Ignore renegotiation race
+              }
+            }
+          } catch {
+            // Ignore
+          }
+        }
+
+        if (callStateRef.current === 'connected') {
+          sendWs({
+            type: 'media:state',
+            micEnabled: micEnabledRef.current,
+            camEnabled: camEnabledRef.current,
+            hasMic: hasHardwareAudioRef.current,
+            webrtcAudioRx: webrtcAudioRxRef.current,
+            webrtcVideoRx: webrtcVideoRxRef.current,
+          });
+        }
+
+        return finalStream;
       })();
 
       mediaInitPromiseRef.current = task;
@@ -636,7 +772,7 @@ export default function App() {
         }
       }
     },
-    []
+    [sendWs]
   );
 
   const handleSwitchCamera = useCallback(async () => {
@@ -702,8 +838,14 @@ export default function App() {
     sdpSentRef.current = false;
     trickleIceSentCountRef.current = 0;
     trickleIceBatchRef.current = [];
+    outboundStreamEpochRef.current = Math.max(
+      outboundStreamEpochRef.current + 1,
+      (Date.now() & 0xffffff) || 1
+    );
     outboundFrameSeqRef.current = 0;
+    lastReceivedFrameEpochRef.current = 0;
     lastReceivedFrameSeqRef.current = 0;
+    lastDrawnFrameEpochRef.current = 0;
     lastDrawnFrameSeqRef.current = 0;
     if (trickleIceFlushTimerRef.current !== null) {
       window.clearTimeout(trickleIceFlushTimerRef.current);
@@ -733,6 +875,10 @@ export default function App() {
     remoteStreamRef.current = null;
     remoteVideoStreamRef.current = null;
     remoteAudioStreamRef.current = null;
+    peerHasMicRef.current = true;
+    setPeerMicEnabled(true);
+    setPeerCamEnabled(true);
+    soundEngine.setRemotePeerMuted(false);
     soundEngine.attachRemoteWebRtcAudioBackup(null, true, null);
     if (remoteVideoRef.current) {
       remoteVideoRef.current.onloadeddata = null;
@@ -876,6 +1022,7 @@ export default function App() {
                 type: 'media:state',
                 micEnabled: micEnabledRef.current,
                 camEnabled: camEnabledRef.current,
+                hasMic: hasHardwareAudioRef.current,
                 webrtcAudioRx: true,
                 webrtcVideoRx: hasDecodedVideo,
               });
@@ -1120,8 +1267,11 @@ export default function App() {
 
     let lastAudioBytesRx = 0;
     let lastVideoBytesRx = 0;
+    let videoStallSeconds = 0;
+    let audioStallSeconds = 0;
+    let lastResyncRequestAt = 0;
 
-    // Poll actual WebRTC RTP bytesReceived every 1s so we know with 100% certainty whether WebRTC media is flowing
+    // Poll actual WebRTC RTP bytesReceived every 1s so we detect real video stalls (e.g. peer switched to Telegram)
     const statsTimer = window.setInterval(async () => {
       const pc = pcRef.current;
       if (!pc || pc.signalingState === 'closed') {
@@ -1143,12 +1293,35 @@ export default function App() {
             }
           }
         });
-        const audioFlowing = webrtcConnectedRef.current || curAudioBytes - lastAudioBytesRx > 250;
-        const videoFlowing =
-          (webrtcConnectedRef.current || curVideoBytes - lastVideoBytesRx > 1000) &&
-          Boolean(remoteVideoRef.current && remoteVideoRef.current.videoWidth > 0);
+        const deltaAudio = curAudioBytes - lastAudioBytesRx;
+        const deltaVideo = curVideoBytes - lastVideoBytesRx;
         lastAudioBytesRx = curAudioBytes;
         lastVideoBytesRx = curVideoBytes;
+
+        if (deltaAudio > 120) {
+          audioStallSeconds = 0;
+        } else {
+          audioStallSeconds++;
+        }
+
+        const hasDecodedVideo = Boolean(remoteVideoRef.current && remoteVideoRef.current.videoWidth > 0);
+        if (deltaVideo > 300 && hasDecodedVideo) {
+          videoStallSeconds = 0;
+          if (remoteVideoRef.current?.paused) {
+            remoteVideoRef.current.play().catch(() => {});
+          }
+        } else {
+          videoStallSeconds++;
+        }
+
+        // When peer has no hardware mic or muted their mic, 0 audio bytes is expected — don't treat as WebRTC stall!
+        const peerExpectsAudio = peerHasMicRef.current && peerMicEnabledRef.current;
+        const audioFlowing =
+          deltaAudio > 120 ||
+          (webrtcConnectedRef.current && (!peerExpectsAudio || audioStallSeconds < 3));
+        // Never assume WebRTC video is flowing forever just because audio/ICE is connected!
+        // If 0 video bytes arrive for >=2s while peer camera is on, immediately fall back & request video resync.
+        const videoFlowing = deltaVideo > 300 && hasDecodedVideo;
 
         // Snapshot live WebRTC video to backup canvas once per second without triggering React re-renders
         const remVideo = remoteVideoRef.current;
@@ -1167,6 +1340,18 @@ export default function App() {
           }
         }
 
+        // If WebRTC is connected and peer's camera is enabled, yet 0 video bytes arrived for 3s (e.g. peer returned from Telegram),
+        // ask the peer to check/re-acquire their camera & kick fallback frames right away!
+        if (
+          webrtcConnectedRef.current &&
+          peerCamEnabledRef.current &&
+          videoStallSeconds >= 3 &&
+          Date.now() - lastResyncRequestAt > 6000
+        ) {
+          lastResyncRequestAt = Date.now();
+          sendWs({ type: 'media:resync' });
+        }
+
         const changed =
           webrtcAudioRxRef.current !== audioFlowing || webrtcVideoRxRef.current !== videoFlowing;
         webrtcAudioRxRef.current = audioFlowing;
@@ -1177,6 +1362,7 @@ export default function App() {
             type: 'media:state',
             micEnabled: micEnabledRef.current,
             camEnabled: camEnabledRef.current,
+            hasMic: hasHardwareAudioRef.current,
             webrtcAudioRx: audioFlowing,
             webrtcVideoRx: videoFlowing,
           });
@@ -1188,16 +1374,16 @@ export default function App() {
 
     const callConnectTs = Date.now();
     let lastFallbackFrameSentAt = 0;
+    let adaptiveMinIntervalMs = 90;
+    let adaptiveMaxDim = 380;
 
     const sendFrameNow = () => {
       const now = Date.now();
-      // Give WebRTC offer/answer a brief 500ms head start, and stop fallback frames once peer actually receives live WebRTC video
-      if (now - callConnectTs < 500 || peerWebrtcVideoRxRef.current) {
+      // Give direct WebRTC P2P 1100ms head start so initial handshake isn't CPU-starved by JPEG/WebP encoding on phones!
+      if (now - callConnectTs < 1100 || peerWebrtcVideoRxRef.current) {
         return;
       }
-      const isServerless = wsRef.current?.mode === 'serverless';
-      const minInterval = isServerless ? 68 : 75;
-      if (now - lastFallbackFrameSentAt < minInterval) {
+      if (now - lastFallbackFrameSentAt < adaptiveMinIntervalMs) {
         return;
       }
       lastFallbackFrameSentAt = now;
@@ -1207,10 +1393,14 @@ export default function App() {
       const ctx = capCanvas.getContext('2d');
       if (!ctx) return;
 
+      const isServerless = wsRef.current?.mode === 'serverless';
       const useWebp = supportsCanvasWebp();
-      const maxDim = isServerless ? (useWebp ? 420 : 340) : 440;
+      const maxDim = Math.min(adaptiveMaxDim, isServerless ? (useWebp ? 380 : 320) : 400);
       const videoEl = localVideoRef.current;
       if (camEnabledRef.current && videoEl && videoEl.readyState >= 2 && videoEl.videoWidth > 0) {
+        if (videoEl.paused) {
+          videoEl.play().catch(() => {});
+        }
         const vw = videoEl.videoWidth || 480;
         const vh = videoEl.videoHeight || 360;
         const scale = Math.min(1, maxDim / Math.max(vw, vh));
@@ -1221,7 +1411,7 @@ export default function App() {
           capCanvas.height = targetH;
         }
         ctx.imageSmoothingEnabled = true;
-        ctx.imageSmoothingQuality = 'medium';
+        ctx.imageSmoothingQuality = 'low';
         ctx.drawImage(videoEl, 0, 0, targetW, targetH);
       } else {
         capCanvas.width = 240;
@@ -1238,12 +1428,23 @@ export default function App() {
       }
 
       try {
+        const t0 = performance.now();
         const dataUrl = useWebp
-          ? capCanvas.toDataURL('image/webp', isServerless ? 0.68 : 0.74)
-          : capCanvas.toDataURL('image/jpeg', isServerless ? 0.62 : 0.72);
+          ? capCanvas.toDataURL('image/webp', isServerless ? 0.64 : 0.72)
+          : capCanvas.toDataURL('image/jpeg', isServerless ? 0.58 : 0.68);
+        const encodeMs = performance.now() - t0;
+        // Adapt capture rate & resolution to device CPU speed so slow Android phones stay responsive
+        if (encodeMs > 24) {
+          adaptiveMinIntervalMs = Math.min(220, adaptiveMinIntervalMs + 25);
+          adaptiveMaxDim = 260;
+        } else if (encodeMs < 10) {
+          adaptiveMinIntervalMs = Math.max(85, adaptiveMinIntervalMs - 10);
+          adaptiveMaxDim = 380;
+        }
         const frameSeq = ++outboundFrameSeqRef.current;
         sendWs({
           type: 'media:frame',
+          epoch: outboundStreamEpochRef.current,
           seq: frameSeq,
           frame: dataUrl,
           micEnabled: micEnabledRef.current,
@@ -1258,31 +1459,64 @@ export default function App() {
       type: 'media:state',
       micEnabled: micEnabledRef.current,
       camEnabled: camEnabledRef.current,
+      hasMic: hasHardwareAudioRef.current,
     });
 
-    const timer = window.setInterval(sendFrameNow, 68);
+    const timer = window.setInterval(sendFrameNow, 85);
 
     let audioCtx: AudioContext | null = null;
     let workletNode: AudioWorkletNode | null = null;
     let sourceNode: MediaStreamAudioSourceNode | null = null;
     let silentGain: GainNode | null = null;
     let workletUrl: string | null = null;
+    let fallbackAudioRunning = false;
     let cancelled = false;
 
+    const teardownFallbackAudioCapture = () => {
+      fallbackAudioRunning = false;
+      try {
+        workletNode?.disconnect();
+        sourceNode?.disconnect();
+        silentGain?.disconnect();
+        audioCtx?.close();
+        if (workletUrl) {
+          URL.revokeObjectURL(workletUrl);
+        }
+      } catch {
+        // Ignore
+      }
+      workletNode = null;
+      sourceNode = null;
+      silentGain = null;
+      audioCtx = null;
+      workletUrl = null;
+    };
+
     const setupFallbackAudioCapture = async () => {
+      if (fallbackAudioRunning || cancelled) return;
+      fallbackAudioRunning = true;
       try {
         let stream = localStreamRef.current;
         if (!stream || stream.getAudioTracks().length === 0) {
           stream = await ensureLocalMedia();
         }
-        if (cancelled || !stream) return;
+        if (cancelled || !stream || webrtcConnectedRef.current || peerWebrtcAudioRxRef.current) {
+          fallbackAudioRunning = false;
+          return;
+        }
         const audioTracks = stream.getAudioTracks();
-        if (audioTracks.length === 0) return;
+        if (audioTracks.length === 0) {
+          fallbackAudioRunning = false;
+          return;
+        }
 
         const AudioCtx =
           window.AudioContext ||
           (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-        if (!AudioCtx) return;
+        if (!AudioCtx) {
+          fallbackAudioRunning = false;
+          return;
+        }
 
         audioCtx = new AudioCtx();
         if (audioCtx.state === 'suspended') {
@@ -1305,8 +1539,7 @@ export default function App() {
           if (
             !micEnabledRef.current ||
             webrtcConnectedRef.current ||
-            peerWebrtcAudioRxRef.current ||
-            Date.now() - callConnectTs < 650
+            peerWebrtcAudioRxRef.current
           ) {
             accum = [];
             return;
@@ -1319,11 +1552,17 @@ export default function App() {
             for (let k = startIdx; k < endIdx; k++) {
               sum += input[k];
             }
-            // Gentle 1.2x pre-boost keeps voice clear without amplifying mic hiss or 8-bit quantization floor
-            accum.push((sum / Math.max(1, endIdx - startIdx)) * 1.2);
+            accum.push((sum / Math.max(1, endIdx - startIdx)) * 1.15);
           }
           while (accum.length >= CHUNK_SAMPLES) {
             const slice = accum.splice(0, CHUNK_SAMPLES);
+            // Skip transmitting silent/hiss-only chunks so mic-less/quiet environments never emit 8-bit white noise
+            let sumSq = 0;
+            for (let s = 0; s < slice.length; s++) {
+              sumSq += slice[s] * slice[s];
+            }
+            const rms = Math.sqrt(sumSq / slice.length);
+            if (rms < 0.0028) continue;
             sendWs({
               type: 'media:audio',
               pcm8: encodePcm8Base64(slice),
@@ -1348,7 +1587,10 @@ export default function App() {
           const blob = new Blob([workletCode], { type: 'application/javascript' });
           workletUrl = URL.createObjectURL(blob);
           await audioCtx.audioWorklet.addModule(workletUrl);
-          if (cancelled) return;
+          if (cancelled || webrtcConnectedRef.current || peerWebrtcAudioRxRef.current) {
+            teardownFallbackAudioCapture();
+            return;
+          }
           workletNode = new AudioWorkletNode(audioCtx, 'intercom-mic-processor');
           workletNode.port.onmessage = (ev) => {
             if (ev.data instanceof Float32Array) {
@@ -1359,27 +1601,30 @@ export default function App() {
           workletNode.connect(silentGain);
         }
       } catch {
-        // Ignore fallback audio errors
+        teardownFallbackAudioCapture();
       }
     };
 
-    setupFallbackAudioCapture();
+    // Lazy-manage fallback AudioContext: NEVER open a second mic AudioContext while WebRTC is healthy
+    // (eliminates Android Pixel AEC contention / speaker white noise when calling mic-less PCs!).
+    const fallbackAudioGuardTimer = window.setInterval(() => {
+      if (cancelled) return;
+      const webrtcAudioActive = webrtcConnectedRef.current || peerWebrtcAudioRxRef.current;
+      if (webrtcAudioActive) {
+        if (fallbackAudioRunning) {
+          teardownFallbackAudioCapture();
+        }
+      } else if (Date.now() - callConnectTs >= 2000 && !fallbackAudioRunning && hasHardwareAudioRef.current) {
+        setupFallbackAudioCapture();
+      }
+    }, 1000);
 
     return () => {
       cancelled = true;
       window.clearInterval(timer);
       window.clearInterval(statsTimer);
-      try {
-        workletNode?.disconnect();
-        sourceNode?.disconnect();
-        silentGain?.disconnect();
-        audioCtx?.close();
-        if (workletUrl) {
-          URL.revokeObjectURL(workletUrl);
-        }
-      } catch {
-        // Ignore
-      }
+      window.clearInterval(fallbackAudioGuardTimer);
+      teardownFallbackAudioCapture();
     };
   }, [callState, ensureLocalMedia, sendWs]);
 
@@ -1472,7 +1717,14 @@ export default function App() {
         }
 
         switch (msg.type) {
-          case 'pong':
+          case 'pong': {
+            if (callStateRef.current === 'incoming' && msg.callId === null) {
+              soundEngine.stopRingLoop();
+              setPeerPin(null);
+              setCallState('idle');
+            }
+            break;
+          }
           case 'server:heartbeat': {
             break;
           }
@@ -1721,21 +1973,26 @@ export default function App() {
             clearAutoDialTimers();
             resetCallChat();
             soundEngine.stopRingLoop();
-            soundEngine.playErrorTone();
             closePeerConnection();
             setPeerPin(null);
             setAutoDialBuffer('');
             setCurrentInput('');
-            setCallState('ended');
             try {
               sessionStorage.removeItem('intercom_last_peer_frame');
             } catch {
               // Ignore
             }
-            const tReset = window.setTimeout(() => {
-              setCallState((prev) => (prev === 'ended' ? 'idle' : prev));
-            }, 1700);
-            autoDialTimeoutsRef.current.push(tReset);
+            if (msg.reason === 'caller_cancelled') {
+              // Unanswered incoming ring expired cleanly after caller hung up -> go straight to idle without error beep
+              setCallState('idle');
+            } else {
+              soundEngine.playErrorTone();
+              setCallState('ended');
+              const tReset = window.setTimeout(() => {
+                setCallState((prev) => (prev === 'ended' ? 'idle' : prev));
+              }, 1700);
+              autoDialTimeoutsRef.current.push(tReset);
+            }
             break;
           }
 
@@ -1885,7 +2142,12 @@ export default function App() {
           case 'media:state': {
             if (typeof msg.micEnabled === 'boolean') {
               setPeerMicEnabled(msg.micEnabled);
+              peerMicEnabledRef.current = msg.micEnabled;
             }
+            if (typeof msg.hasMic === 'boolean') {
+              peerHasMicRef.current = msg.hasMic;
+            }
+            soundEngine.setRemotePeerMuted(!peerMicEnabledRef.current || !peerHasMicRef.current);
             if (typeof msg.camEnabled === 'boolean') {
               setPeerCamEnabled(msg.camEnabled);
             }
@@ -1894,6 +2156,32 @@ export default function App() {
             }
             if (typeof msg.webrtcVideoRx === 'boolean') {
               peerWebrtcVideoRxRef.current = msg.webrtcVideoRx;
+            }
+            break;
+          }
+
+          case 'media:resync': {
+            // Peer detected frozen/stalled video from us (e.g. after we switched to Telegram and returned):
+            // re-verify or re-acquire our local camera and kick fresh fallback frames until WebRTC resumes!
+            peerWebrtcVideoRxRef.current = false;
+            outboundStreamEpochRef.current = Math.max(
+              outboundStreamEpochRef.current + 1,
+              (Date.now() & 0xffffff) || 1
+            );
+            outboundFrameSeqRef.current = 0;
+            if (camEnabledRef.current) {
+              const curTrack = localStreamRef.current?.getVideoTracks()[0];
+              const isStale =
+                !hasHardwareVideoRef.current ||
+                !curTrack ||
+                curTrack.readyState !== 'live' ||
+                curTrack.muted;
+              if (localVideoRef.current?.paused) {
+                localVideoRef.current.play().catch(() => {});
+              }
+              if (isStale) {
+                ensureLocalMedia(undefined, true);
+              }
             }
             break;
           }
@@ -1907,7 +2195,8 @@ export default function App() {
             }
             if (typeof msg.frame === 'string' && !webrtcVideoRxRef.current) {
               const incomingSeq = typeof msg.seq === 'number' ? msg.seq : undefined;
-              drawFrameToRemoteCanvas(msg.frame, incomingSeq);
+              const incomingEpoch = typeof msg.epoch === 'number' ? msg.epoch : undefined;
+              drawFrameToRemoteCanvas(msg.frame, incomingSeq, incomingEpoch);
             } else if (webrtcVideoRxRef.current && Date.now() - lastMediaStateAckAtRef.current > 2000) {
               // Re-confirm live WebRTC video reception so the peer immediately halts redundant fallback frames
               lastMediaStateAckAtRef.current = Date.now();
@@ -2077,14 +2366,25 @@ export default function App() {
         connect();
       } else {
         try {
-          ws.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
+          ws.send(JSON.stringify({ type: 'wakeup', ts: Date.now() }));
         } catch {
           isConnecting = false;
           connect();
         }
       }
       if (callStateRef.current === 'connected') {
-        ensureLocalMedia();
+        // Recover iOS/Android camera if OS ended or muted the video track while user was in Telegram!
+        const curVidTrack = localStreamRef.current?.getVideoTracks()[0];
+        const videoNeedsRecovery =
+          camEnabledRef.current &&
+          (!hasHardwareVideoRef.current ||
+            !curVidTrack ||
+            curVidTrack.readyState !== 'live' ||
+            curVidTrack.muted);
+        if (localVideoRef.current?.paused) {
+          localVideoRef.current.play().catch(() => {});
+        }
+        ensureLocalMedia(undefined, videoNeedsRecovery);
         unlockRemoteAudioElements();
       }
     };
@@ -2358,6 +2658,7 @@ export default function App() {
         type: 'media:state',
         micEnabled: next,
         camEnabled: camEnabledRef.current,
+        hasMic: hasHardwareAudioRef.current,
         webrtcAudioRx: webrtcAudioRxRef.current,
         webrtcVideoRx: webrtcVideoRxRef.current,
       });
@@ -2379,6 +2680,7 @@ export default function App() {
         type: 'media:state',
         micEnabled: micEnabledRef.current,
         camEnabled: next,
+        hasMic: hasHardwareAudioRef.current,
         webrtcAudioRx: webrtcAudioRxRef.current,
         webrtcVideoRx: webrtcVideoRxRef.current,
       });
@@ -2486,7 +2788,7 @@ export default function App() {
           remoteVideoCanvasRef={remoteCanvasDisplayRef}
           localVideoElementRef={localVideoRef}
           remoteVideoElementRef={remoteVideoRef}
-          remoteFrameSeq={remoteFrameSeq}
+          remoteFrameVersionRef={remoteFrameVersionRef}
           isCallConnected={callState === 'connected'}
           peerPin={peerPin}
           myPin={myPin}
@@ -2636,7 +2938,6 @@ export default function App() {
         localVideoElementRef={localVideoRef}
         remoteVideoElementRef={remoteVideoRef}
         remoteFallbackCanvasRef={remoteCanvasDisplayRef}
-        remoteFrameSeq={remoteFrameSeq}
       />
 
       {/* Personal PIN Code Configuration Modal */}

@@ -18,7 +18,7 @@ export interface IntercomScene3DProps {
   remoteVideoCanvasRef?: React.RefObject<HTMLCanvasElement | null>;
   localVideoElementRef?: React.RefObject<HTMLVideoElement | null>;
   remoteVideoElementRef?: React.RefObject<HTMLVideoElement | null>;
-  remoteFrameSeq?: number;
+  remoteFrameVersionRef?: React.RefObject<number>;
   isCallConnected?: boolean;
   peerPin?: string | null;
   myPin?: string;
@@ -948,7 +948,7 @@ export const IntercomScene3D: React.FC<IntercomScene3DProps> = ({
   remoteVideoCanvasRef,
   localVideoElementRef,
   remoteVideoElementRef,
-  remoteFrameSeq,
+  remoteFrameVersionRef,
   isCallConnected,
   peerPin,
   myPin,
@@ -1076,6 +1076,10 @@ export const IntercomScene3D: React.FC<IntercomScene3DProps> = ({
     // Optimized near/far plane ratio (0.25 .. 25) to maximize mobile depth-buffer precision and prevent Z-fighting when zoomed out
     const camera = new THREE.PerspectiveCamera(40, width / height, 0.25, 25);
 
+    const isTouchDevice =
+      typeof window !== 'undefined' &&
+      ('ontouchstart' in window || navigator.maxTouchPoints > 0);
+
     let renderer: THREE.WebGLRenderer | null = null;
     let softCanvas: HTMLCanvasElement | null = null;
     let domElem: HTMLCanvasElement;
@@ -1088,10 +1092,14 @@ export const IntercomScene3D: React.FC<IntercomScene3DProps> = ({
       renderer.outputColorSpace = THREE.SRGBColorSpace;
       renderer.toneMapping = THREE.ACESFilmicToneMapping;
       renderer.toneMappingExposure = 1.12;
-      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      // Cap mobile touch screens at 1.5x DPR (cuts fragment shader load ~45% on 3x Pixel screens while staying razor-sharp)
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, isTouchDevice ? 1.5 : 2));
       renderer.setSize(width, height);
       renderer.shadowMap.enabled = true;
       renderer.shadowMap.type = THREE.PCFShadowMap;
+      // Intercom geometry & lights are static — render shadows on demand instead of 60x/sec!
+      renderer.shadowMap.autoUpdate = false;
+      renderer.shadowMap.needsUpdate = true;
 
       const pmremGenerator = new THREE.PMREMGenerator(renderer);
       scene.environment = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
@@ -1110,9 +1118,6 @@ export const IntercomScene3D: React.FC<IntercomScene3DProps> = ({
     container.innerHTML = '';
     container.appendChild(domElem);
 
-    const isTouchDevice =
-      typeof window !== 'undefined' &&
-      ('ontouchstart' in window || navigator.maxTouchPoints > 0);
     domElem.style.touchAction = 'none';
 
     const controls = new OrbitControls(camera, domElem);
@@ -2591,6 +2596,25 @@ export const IntercomScene3D: React.FC<IntercomScene3DProps> = ({
 
     const prevCamPos = new THREE.Vector3().copy(camera.position);
     const prevTargetPos = new THREE.Vector3().copy(controls.target);
+    let opticsDirty = true;
+    let lastOpticsDrawAt = 0;
+
+    function maybeRefreshOpticsCanvas(now: number, force = false) {
+      if (!force && now - lastOpticsDrawAt < 33) return;
+      lastOpticsDrawAt = now;
+      opticsDirty = false;
+      const camDx = THREE.MathUtils.clamp((camera.position.x - controls.target.x) / 3.2, -1, 1);
+      const camDy = THREE.MathUtils.clamp((camera.position.y - controls.target.y) / 3.2, -1, 1);
+      renderCameraOpticsCanvas(
+        cameraOpticsCanvas,
+        localVideoElementRef?.current,
+        livePropsRef.current.camEnabled,
+        livePropsRef.current.mirrorLocalVideo,
+        camDx,
+        camDy
+      );
+      cameraOpticsTex.needsUpdate = true;
+    }
 
     function requestRender() {
       if (unmounted) return;
@@ -2612,6 +2636,10 @@ export const IntercomScene3D: React.FC<IntercomScene3DProps> = ({
         prevCamPos.copy(camera.position);
         prevTargetPos.copy(controls.target);
 
+        if (opticsDirty || camMoved) {
+          maybeRefreshOpticsCanvas(now, false);
+        }
+
         const buttonsMoving = stepButtonAnimations(now);
         if (isSoftwareGl) {
           renderSoftwareScene();
@@ -2631,17 +2659,7 @@ export const IntercomScene3D: React.FC<IntercomScene3DProps> = ({
 
     controls.addEventListener('change', () => {
       enforceCameraOutsideIntercom();
-      const camDx = THREE.MathUtils.clamp((camera.position.x - controls.target.x) / 3.2, -1, 1);
-      const camDy = THREE.MathUtils.clamp((camera.position.y - controls.target.y) / 3.2, -1, 1);
-      renderCameraOpticsCanvas(
-        cameraOpticsCanvas,
-        localVideoElementRef?.current,
-        livePropsRef.current.camEnabled,
-        livePropsRef.current.mirrorLocalVideo,
-        camDx,
-        camDy
-      );
-      cameraOpticsTex.needsUpdate = true;
+      opticsDirty = true;
       requestRender();
     });
 
@@ -2750,11 +2768,8 @@ export const IntercomScene3D: React.FC<IntercomScene3DProps> = ({
       const remoteVideo = remoteVideoElementRef?.current;
       const remoteCanvas = remoteVideoCanvasRef?.current;
 
-      // Instant zero-lag camera optics mirror reflection (static housing is cached, so per-frame draw is <0.2ms)
-      const camDx = THREE.MathUtils.clamp((camera.position.x - controls.target.x) / 3.2, -1, 1);
-      const camDy = THREE.MathUtils.clamp((camera.position.y - controls.target.y) / 3.2, -1, 1);
-      renderCameraOpticsCanvas(cameraOpticsCanvas, localVideo, isCamOn, mirrorSelf, camDx, camDy);
-      cameraOpticsTex.needsUpdate = true;
+      // Update camera optics mirror reflection at up to 30 FPS (imperceptible lag, halves mobile texture uploads)
+      maybeRefreshOpticsCanvas(performance.now(), false);
 
       ctx.fillStyle = '#090b0e';
       ctx.fillRect(0, 0, w, h);
@@ -3021,6 +3036,7 @@ export const IntercomScene3D: React.FC<IntercomScene3DProps> = ({
       }
       if (renderer) {
         renderer.toneMappingExposure = night ? 0.88 : 1.12;
+        renderer.shadowMap.needsUpdate = true;
       }
       sharedButtonMaterials.forEach((mat) => {
         if (mat instanceof THREE.MeshStandardMaterial) {
@@ -3036,6 +3052,9 @@ export const IntercomScene3D: React.FC<IntercomScene3DProps> = ({
       brandGroups.eltis.visible = b === 'eltis';
       brandGroups.vizit.visible = b === 'vizit';
       brandGroups.cyfral.visible = b === 'cyfral';
+      if (renderer) {
+        renderer.shadowMap.needsUpdate = true;
+      }
       requestRender();
     }
 
@@ -3063,20 +3082,27 @@ export const IntercomScene3D: React.FC<IntercomScene3DProps> = ({
     switchBrand(brand);
     setNightMode(Boolean(livePropsRef.current.isNightMode));
     drawDisplay(displayText, brand);
+    maybeRefreshOpticsCanvas(performance.now(), true);
     drawVideoScreenNow();
 
+    let lastSeenRemoteFrameVersion = remoteFrameVersionRef?.current ?? 0;
+
+    // 30 FPS screen texture refresh — also polls remoteFrameVersionRef with zero React re-renders!
     const screenRefreshInterval = !isSoftwareGl
       ? window.setInterval(() => {
           if (unmounted) return;
           const locVid = localVideoElementRef?.current;
           const remVid = remoteVideoElementRef?.current;
+          const curFrameVersion = remoteFrameVersionRef?.current ?? 0;
+          const fallbackFrameChanged = curFrameVersion !== lastSeenRemoteFrameVersion;
           const hasLiveVideoStream =
             (livePropsRef.current.camEnabled && locVid && locVid.readyState >= 2) ||
             (livePropsRef.current.isCallConnected && remVid && remVid.readyState >= 2);
-          if (hasLiveVideoStream) {
+          if (hasLiveVideoStream || fallbackFrameChanged) {
+            lastSeenRemoteFrameVersion = curFrameVersion;
             drawVideoScreenNow();
           }
-        }, 16)
+        }, 33)
       : window.setTimeout(() => {
           if (unmounted) return;
           drawVideoScreenNow();
@@ -3357,7 +3383,6 @@ export const IntercomScene3D: React.FC<IntercomScene3DProps> = ({
     sceneApiRef.current.refreshVideoScreen();
   }, [
     displayText,
-    remoteFrameSeq,
     isCallConnected,
     peerPin,
     myPin,

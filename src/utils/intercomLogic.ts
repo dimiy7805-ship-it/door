@@ -469,5 +469,182 @@ export function resolveShareableSiteUrl(currentHref?: string | null): string {
   }
 }
 
+/**
+ * Deterministically resolves simultaneous-call glare when two peers dial each other at the exact same moment.
+ * Both sides independently compute the identical canonical `callId` and complementary `initiator` roles.
+ */
+export function resolveSimultaneousCallGlare(
+  selfClientId: string,
+  selfCallId: string,
+  peerClientId: string,
+  peerCallId: string
+): { callId: string; initiator: boolean } {
+  const selfWins = selfClientId < peerClientId;
+  return {
+    callId: selfWins ? selfCallId : peerCallId,
+    initiator: selfWins,
+  };
+}
+
+/**
+ * Epoch-aware monotonic frame ordering gate.
+ * Drops out-of-order / delayed frames within the same stream epoch while cleanly accepting
+ * frames from a newer stream epoch (e.g. after a peer returns from background or reloads).
+ */
+export function shouldAcceptVideoFrame(
+  incomingEpoch: number | undefined,
+  incomingSeq: number | undefined,
+  lastEpoch: number,
+  lastSeq: number
+): { accept: boolean; nextEpoch: number; nextSeq: number } {
+  if (typeof incomingSeq !== 'number' || incomingSeq <= 0) {
+    return { accept: true, nextEpoch: lastEpoch, nextSeq: lastSeq };
+  }
+  const hasEpoch = typeof incomingEpoch === 'number' && incomingEpoch > 0;
+  if (hasEpoch) {
+    if (lastEpoch > 0 && incomingEpoch < lastEpoch) {
+      return { accept: false, nextEpoch: lastEpoch, nextSeq: lastSeq };
+    }
+    if (incomingEpoch > lastEpoch) {
+      return { accept: true, nextEpoch: incomingEpoch, nextSeq: incomingSeq };
+    }
+  } else if (incomingSeq <= 3 && lastSeq > 20) {
+    // Legacy restart fallback when peer doesn't send streamEpoch
+    return { accept: true, nextEpoch: lastEpoch, nextSeq: incomingSeq };
+  }
+  if (incomingSeq <= lastSeq) {
+    return { accept: false, nextEpoch: lastEpoch, nextSeq: lastSeq };
+  }
+  return { accept: true, nextEpoch: hasEpoch ? incomingEpoch : lastEpoch, nextSeq: incomingSeq };
+}
+
+/**
+ * Computes bounded exponential backoff delay for WebSocket reconnect attempts
+ * so blocked/filtered endpoints never flood a VPN or mobile network with socket churn.
+ */
+export function computeBackoffDelayMs(
+  attempt: number,
+  baseMs = 3000,
+  maxMs = 90000
+): number {
+  const clampedAttempt = Math.max(1, Math.min(12, Math.floor(attempt)));
+  return Math.min(maxMs, Math.round(baseMs * Math.pow(2, clampedAttempt - 1)));
+}
+
+/**
+ * Determines whether an incoming call:invite packet represents a genuinely active live dial.
+ * Blocks stored pre-EOSE relay history and previously cancelled/ended callIds so returning
+ * to a backgrounded mobile browser NEVER rings a phantom call after the caller hung up.
+ */
+export function shouldAcceptIncomingInvite(params: {
+  callId: string;
+  endedCallIds: ReadonlySet<string>;
+  isPreEoseHistory: boolean;
+}): boolean {
+  const { callId, endedCallIds, isPreEoseHistory } = params;
+  if (!callId) return false;
+  if (isPreEoseHistory) return false;
+  if (endedCallIds.has(callId)) return false;
+  return true;
+}
+
+/**
+ * Checks if an unanswered incoming call has stopped receiving live dial heartbeats
+ * (e.g. caller hung up while the receiver was in Telegram or offline).
+ */
+export function isIncomingRingExpired(
+  lastInviteAt: number,
+  now: number,
+  maxGapMs = 6200
+): boolean {
+  if (lastInviteAt <= 0) return true;
+  return now - lastInviteAt > maxGapMs;
+}
+
+export interface AdaptiveNoiseGateInput {
+  rms: number;
+  vocalEnergy: number;
+  highBandEnergy: number;
+  noiseFloorRms: number;
+  stationarySeconds: number;
+  dtSec: number;
+  peerMuted: boolean;
+}
+
+export interface AdaptiveNoiseGateResult {
+  targetGain: number;
+  nextNoiseFloorRms: number;
+  nextStationarySeconds: number;
+}
+
+/**
+ * Adaptive spectral anti-hiss gate for remote intercom audio:
+ * - Immediately mutes (gain = 0) when peer has no hardware mic or muted their mic.
+ * - Preserves natural quiet room sounds, whispers, and rustling on real microphones.
+ * - Detects continuous stationary broadband white noise (e.g. unplugged desktop 3.5mm jack
+ *   cranked up by browser AGC) and smoothly silences it while opening immediately on speech.
+ */
+export function evaluateAdaptiveNoiseGate(
+  input: AdaptiveNoiseGateInput
+): AdaptiveNoiseGateResult {
+  const { rms, vocalEnergy, highBandEnergy, noiseFloorRms, stationarySeconds, dtSec, peerMuted } =
+    input;
+
+  if (peerMuted) {
+    return {
+      targetGain: 0,
+      nextNoiseFloorRms: noiseFloorRms,
+      nextStationarySeconds: 0,
+    };
+  }
+
+  // Pure digital silence / ultra-low floor -> mute cleanly without affecting audible speech/rustling
+  if (rms < 0.0018) {
+    const decayedFloor = noiseFloorRms * 0.92 + rms * 0.08;
+    return {
+      targetGain: 0,
+      nextNoiseFloorRms: decayedFloor,
+      nextStationarySeconds: Math.max(0, stationarySeconds - dtSec),
+    };
+  }
+
+  // Track the slow ambient floor: drops quickly when quiet, rises very slowly when constant
+  const nextFloor =
+    rms < noiseFloorRms
+      ? noiseFloorRms * 0.85 + rms * 0.15
+      : noiseFloorRms === 0
+        ? rms
+        : Math.min(rms, noiseFloorRms + dtSec * 0.008);
+
+  const safeVocal = Math.max(1e-6, vocalEnergy);
+  const hissRatio = highBandEnergy / safeVocal;
+  const nearFloor = nextFloor > 0.0045 && rms <= nextFloor * 1.48;
+  // Broadband white noise has high energy in 3.5-7.5 kHz compared to vocal 150-2500 Hz
+  const looksLikeWhiteHiss = nearFloor && hissRatio >= 0.42;
+
+  if (looksLikeWhiteHiss) {
+    const nextStat = Math.min(5, stationarySeconds + dtSec);
+    if (nextStat >= 1.2) {
+      return {
+        targetGain: 0.02,
+        nextNoiseFloorRms: nextFloor,
+        nextStationarySeconds: nextStat,
+      };
+    }
+    return {
+      targetGain: 1.0,
+      nextNoiseFloorRms: nextFloor,
+      nextStationarySeconds: nextStat,
+    };
+  }
+
+  // Speech, whispers, or natural room dynamics rising above the floor -> full transparent gain!
+  return {
+    targetGain: 1.0,
+    nextNoiseFloorRms: nextFloor,
+    nextStationarySeconds: Math.max(0, stationarySeconds - dtSec * 2.5),
+  };
+}
+
 
 

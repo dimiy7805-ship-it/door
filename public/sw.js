@@ -1,4 +1,4 @@
-const CACHE_NAME = 'domofon-line-pwa-v9';
+const CACHE_NAME = 'domofon-line-pwa-v11';
 const SHELL_ASSETS = [
   './',
   './index.html',

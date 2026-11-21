@@ -56,7 +56,6 @@ interface FullscreenMonitorProps {
   localVideoElementRef: React.RefObject<HTMLVideoElement | null>;
   remoteVideoElementRef: React.RefObject<HTMLVideoElement | null>;
   remoteFallbackCanvasRef: React.RefObject<HTMLCanvasElement | null>;
-  remoteFrameSeq: number;
 }
 
 export const FullscreenMonitor: React.FC<FullscreenMonitorProps> = ({
@@ -90,7 +89,6 @@ export const FullscreenMonitor: React.FC<FullscreenMonitorProps> = ({
   localVideoElementRef,
   remoteVideoElementRef,
   remoteFallbackCanvasRef,
-  remoteFrameSeq,
 }) => {
   const stageRef = useRef<HTMLDivElement | null>(null);
   const fieldRef = useRef<HTMLDivElement | null>(null);

@@ -13,6 +13,12 @@ import {
   resolveEffectiveRotation,
   PUBLIC_SITE_URL,
   resolveShareableSiteUrl,
+  resolveSimultaneousCallGlare,
+  shouldAcceptVideoFrame,
+  computeBackoffDelayMs,
+  shouldAcceptIncomingInvite,
+  isIncomingRingExpired,
+  evaluateAdaptiveNoiseGate,
 } from './intercomLogic';
 import { encodePcm8Base64, decodePcm8Base64 } from './soundEngine';
 
@@ -219,3 +225,119 @@ test('encodePcm8Base64 and decodePcm8Base64 roundtrip voice waveform accurately 
     assert.equal(Math.abs(decoded[i] - input[i]) < 0.03, true);
   }
 });
+
+test('resolveSimultaneousCallGlare agrees symmetrically on canonical callId and initiator', () => {
+  const peerA = resolveSimultaneousCallGlare('u_100_a', 'call_a', 'u_200_b', 'call_b');
+  const peerB = resolveSimultaneousCallGlare('u_200_b', 'call_b', 'u_100_a', 'call_a');
+  assert.equal(peerA.callId, peerB.callId);
+  assert.equal(peerA.callId, 'call_a');
+  assert.equal(peerA.initiator, true);
+  assert.equal(peerB.initiator, false);
+});
+
+test('shouldAcceptVideoFrame enforces monotonic order and cleanly resets on new streamEpoch', () => {
+  // Normal increasing sequence
+  const r1 = shouldAcceptVideoFrame(100, 10, 100, 9);
+  assert.deepEqual(r1, { accept: true, nextEpoch: 100, nextSeq: 10 });
+
+  // Stale out-of-order frame in same epoch is dropped
+  const r2 = shouldAcceptVideoFrame(100, 8, 100, 10);
+  assert.deepEqual(r2, { accept: false, nextEpoch: 100, nextSeq: 10 });
+
+  // Peer reloads / returns from background with newer streamEpoch and seq=1 -> ACCEPTED!
+  const r3 = shouldAcceptVideoFrame(200, 1, 100, 500);
+  assert.deepEqual(r3, { accept: true, nextEpoch: 200, nextSeq: 1 });
+
+  // Delayed packet from old epoch 100 after switching to epoch 200 -> DROPPED!
+  const r4 = shouldAcceptVideoFrame(100, 501, 200, 1);
+  assert.deepEqual(r4, { accept: false, nextEpoch: 200, nextSeq: 1 });
+});
+
+test('computeBackoffDelayMs grows exponentially and caps at maxMs', () => {
+  assert.equal(computeBackoffDelayMs(1, 3000, 90000), 3000);
+  assert.equal(computeBackoffDelayMs(2, 3000, 90000), 6000);
+  assert.equal(computeBackoffDelayMs(3, 3000, 90000), 12000);
+  assert.equal(computeBackoffDelayMs(10, 3000, 90000), 90000);
+});
+
+test('shouldAcceptIncomingInvite blocks pre-EOSE relay history and already ended calls', () => {
+  const ended = new Set(['call_cancelled_1']);
+  assert.equal(
+    shouldAcceptIncomingInvite({
+      callId: 'call_live_2',
+      endedCallIds: ended,
+      isPreEoseHistory: false,
+    }),
+    true
+  );
+  assert.equal(
+    shouldAcceptIncomingInvite({
+      callId: 'call_live_2',
+      endedCallIds: ended,
+      isPreEoseHistory: true,
+    }),
+    false
+  );
+  assert.equal(
+    shouldAcceptIncomingInvite({
+      callId: 'call_cancelled_1',
+      endedCallIds: ended,
+      isPreEoseHistory: false,
+    }),
+    false
+  );
+});
+
+test('isIncomingRingExpired detects when caller stopped dialing while receiver was away', () => {
+  assert.equal(isIncomingRingExpired(10_000, 14_000, 6200), false);
+  assert.equal(isIncomingRingExpired(10_000, 16_500, 6200), true);
+  assert.equal(isIncomingRingExpired(0, 10_000, 6200), true);
+});
+
+test('evaluateAdaptiveNoiseGate silences muted/mic-less peers and stationary white noise while passing real speech', () => {
+  // Peer muted or has no hardware microphone -> immediate silence
+  const muted = evaluateAdaptiveNoiseGate({
+    rms: 0.03,
+    vocalEnergy: 0.02,
+    highBandEnergy: 0.02,
+    noiseFloorRms: 0.02,
+    stationarySeconds: 0,
+    dtSec: 0.04,
+    peerMuted: true,
+  });
+  assert.equal(muted.targetGain, 0);
+
+  // Continuous unplugged-PC-jack white noise (flat spectrum, constant elevated floor for >1.2s) -> silenced
+  let floor = 0.025;
+  let stat = 0;
+  let gain = 1;
+  for (let i = 0; i < 40; i++) {
+    const res = evaluateAdaptiveNoiseGate({
+      rms: 0.026,
+      vocalEnergy: 0.02,
+      highBandEnergy: 0.018, // hissRatio = 0.9 -> broadband white noise
+      noiseFloorRms: floor,
+      stationarySeconds: stat,
+      dtSec: 0.04,
+      peerMuted: false,
+    });
+    floor = res.nextNoiseFloorRms;
+    stat = res.nextStationarySeconds;
+    gain = res.targetGain;
+  }
+  assert.equal(gain <= 0.05, true);
+
+  // Real voice / quiet rustling on friend's mic -> immediately opens to full transparent 1.0 gain!
+  const speech = evaluateAdaptiveNoiseGate({
+    rms: 0.045,
+    vocalEnergy: 0.08,
+    highBandEnergy: 0.008, // vocal-dominant spectrum
+    noiseFloorRms: 0.003,
+    stationarySeconds: stat,
+    dtSec: 0.04,
+    peerMuted: false,
+  });
+  assert.equal(speech.targetGain, 1.0);
+});
+
+
