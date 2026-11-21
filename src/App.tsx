@@ -270,6 +270,9 @@ export default function App() {
   const trickleIceBatchRef = useRef<RTCIceCandidateInit[]>([]);
   const trickleIceFlushTimerRef = useRef<number | null>(null);
   const lastMediaStateAckAtRef = useRef<number>(0);
+  const outboundFrameSeqRef = useRef<number>(0);
+  const lastReceivedFrameSeqRef = useRef<number>(0);
+  const lastDrawnFrameSeqRef = useRef<number>(0);
   const webrtcOfferRetryTimerRef = useRef<number | null>(null);
   const iceRestartTimerRef = useRef<number | null>(null);
   const iceRestartedRef = useRef<boolean>(false);
@@ -295,8 +298,12 @@ export default function App() {
   const chatMessagesRef = useRef(chatMessages);
   chatMessagesRef.current = chatMessages;
 
-  const drawFrameToRemoteCanvas = useCallback((frameDataUrl: string) => {
+  const drawFrameToRemoteCanvas = useCallback((frameDataUrl: string, frameSeq?: number) => {
     if (!frameDataUrl) return;
+    if (typeof frameSeq === 'number' && frameSeq > 0) {
+      if (frameSeq <= lastReceivedFrameSeqRef.current) return;
+      lastReceivedFrameSeqRef.current = frameSeq;
+    }
     try {
       sessionStorage.setItem('intercom_last_peer_frame', frameDataUrl);
     } catch {
@@ -304,6 +311,10 @@ export default function App() {
     }
     const img = new Image();
     img.onload = () => {
+      if (typeof frameSeq === 'number' && frameSeq > 0) {
+        if (frameSeq < lastDrawnFrameSeqRef.current) return;
+        lastDrawnFrameSeqRef.current = frameSeq;
+      }
       const remCanvas = remoteCanvasDisplayRef.current;
       if (!remCanvas) return;
       const iw = img.naturalWidth || 480;
@@ -691,6 +702,9 @@ export default function App() {
     sdpSentRef.current = false;
     trickleIceSentCountRef.current = 0;
     trickleIceBatchRef.current = [];
+    outboundFrameSeqRef.current = 0;
+    lastReceivedFrameSeqRef.current = 0;
+    lastDrawnFrameSeqRef.current = 0;
     if (trickleIceFlushTimerRef.current !== null) {
       window.clearTimeout(trickleIceFlushTimerRef.current);
       trickleIceFlushTimerRef.current = null;
@@ -1227,8 +1241,10 @@ export default function App() {
         const dataUrl = useWebp
           ? capCanvas.toDataURL('image/webp', isServerless ? 0.68 : 0.74)
           : capCanvas.toDataURL('image/jpeg', isServerless ? 0.62 : 0.72);
+        const frameSeq = ++outboundFrameSeqRef.current;
         sendWs({
           type: 'media:frame',
+          seq: frameSeq,
           frame: dataUrl,
           micEnabled: micEnabledRef.current,
           camEnabled: camEnabledRef.current,
@@ -1890,7 +1906,8 @@ export default function App() {
               setPeerCamEnabled(msg.camEnabled);
             }
             if (typeof msg.frame === 'string' && !webrtcVideoRxRef.current) {
-              drawFrameToRemoteCanvas(msg.frame);
+              const incomingSeq = typeof msg.seq === 'number' ? msg.seq : undefined;
+              drawFrameToRemoteCanvas(msg.frame, incomingSeq);
             } else if (webrtcVideoRxRef.current && Date.now() - lastMediaStateAckAtRef.current > 2000) {
               // Re-confirm live WebRTC video reception so the peer immediately halts redundant fallback frames
               lastMediaStateAckAtRef.current = Date.now();

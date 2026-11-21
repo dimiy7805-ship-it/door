@@ -868,7 +868,8 @@ class ServerlessMeshTransport implements IntercomTransport {
   }
 
   private selectMediaSockets(
-    targetId?: string
+    targetId?: string,
+    maxSockets = 2
   ): Array<{ url: string; ws: WebSocket; isJsonRelay: boolean }> {
     const openEntries: Array<{ url: string; ws: WebSocket; isJsonRelay: boolean }> = [];
     // Put binary MQTT brokers first so same-Wi-Fi or open-MQTT networks use ultra-fast binary MQTT instead of rate-limited JSON relays
@@ -886,7 +887,7 @@ class ServerlessMeshTransport implements IntercomTransport {
         openEntries.push({ url, ws, isJsonRelay: true });
       }
     }
-    if (openEntries.length <= 2) {
+    if (openEntries.length <= maxSockets) {
       return openEntries;
     }
 
@@ -894,10 +895,19 @@ class ServerlessMeshTransport implements IntercomTransport {
     const chosenUrls = new Set<string>();
     const peer = targetId ? this.peers.get(targetId) : undefined;
 
-    // 1. Prefer verified binary MQTT brokers from which we have received packets from this peer (lowest latency & zero event-rate throttling)
+    // 1. Prefer the freshest binary MQTT broker over which we most recently heard from this peer (lowest current RTT)
+    if (peer?.lastBrokerUrl) {
+      const latestMqtt = openEntries.find((e) => e.url === peer.lastBrokerUrl && !e.isJsonRelay);
+      if (latestMqtt) {
+        chosen.push(latestMqtt);
+        chosenUrls.add(latestMqtt.url);
+      }
+    }
+
+    // 2. Prefer other verified binary MQTT brokers from which we have received packets from this peer
     if (peer?.verifiedBrokers) {
       for (const vb of peer.verifiedBrokers) {
-        if (chosen.length >= 2) break;
+        if (chosen.length >= maxSockets) break;
         const found = openEntries.find((e) => e.url === vb && !e.isJsonRelay);
         if (found && !chosenUrls.has(found.url)) {
           chosen.push(found);
@@ -906,8 +916,8 @@ class ServerlessMeshTransport implements IntercomTransport {
       }
     }
 
-    // 2. Prefer the broker/relay over which we most recently heard from this peer
-    if (peer?.lastBrokerUrl && chosen.length < 2 && !chosenUrls.has(peer.lastBrokerUrl)) {
+    // 3. Fallback to the broker/relay over which we most recently heard from this peer (e.g. Port-443 JSON relay on mobile)
+    if (peer?.lastBrokerUrl && chosen.length < maxSockets && !chosenUrls.has(peer.lastBrokerUrl)) {
       const found = openEntries.find((e) => e.url === peer.lastBrokerUrl);
       if (found) {
         chosen.push(found);
@@ -915,10 +925,10 @@ class ServerlessMeshTransport implements IntercomTransport {
       }
     }
 
-    // 3. Include any other verified broker/relay from which we have received packets from this peer
+    // 4. Include any other verified broker/relay from which we have received packets from this peer
     if (peer?.verifiedBrokers) {
       for (const vb of peer.verifiedBrokers) {
-        if (chosen.length >= 2) break;
+        if (chosen.length >= maxSockets) break;
         if (!chosenUrls.has(vb)) {
           const found = openEntries.find((e) => e.url === vb);
           if (found) {
@@ -929,18 +939,18 @@ class ServerlessMeshTransport implements IntercomTransport {
       }
     }
 
-    // 4. Include a Port-443 socket (JSON relay or shiftr:443) if we still need a 2nd redundant socket
+    // 5. Include a Port-443 socket (JSON relay or shiftr:443) if we still need another socket
     for (const entry of openEntries) {
-      if (chosen.length >= 2) break;
+      if (chosen.length >= maxSockets) break;
       if (!chosenUrls.has(entry.url) && (entry.isJsonRelay || entry.url.includes(':443'))) {
         chosen.push(entry);
         chosenUrls.add(entry.url);
       }
     }
 
-    // 5. Fill up to 2 sockets for redundancy
+    // 6. Fill up to maxSockets
     for (const entry of openEntries) {
-      if (chosen.length >= 2) break;
+      if (chosen.length >= maxSockets) break;
       if (!chosenUrls.has(entry.url)) {
         chosen.push(entry);
         chosenUrls.add(entry.url);
@@ -984,10 +994,11 @@ class ServerlessMeshTransport implements IntercomTransport {
       options?.directTargetId || (typeof payload.targetId === 'string' ? payload.targetId : '');
 
     if (options?.isHighRateMedia && targetId) {
-      // High-rate video frames and voice audio chunks go strictly to the partner's direct topic/tag
-      // on the top 2 verified sockets via the paced outbox—zero self-echo on MESH_TOPIC!
+      // Send video frames over the SINGLE fastest socket (strict in-order TCP delivery, zero out-of-order ping-pong,
+      // and half the Wi-Fi upload bandwidth!); keep 2-socket redundancy for audio continuity.
       const category = options.mediaKind === 'audio' ? 'audio' : 'frame';
-      const sockets = this.selectMediaSockets(targetId);
+      const maxSockets = category === 'frame' ? 1 : 2;
+      const sockets = this.selectMediaSockets(targetId, maxSockets);
       let mqttDirectPacket: ArrayBuffer | null = null;
       let jsonRelayDirectPacket: string | null = null;
 

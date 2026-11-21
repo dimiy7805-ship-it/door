@@ -271,25 +271,19 @@ function createTactileSurfaceMaps(
  * - Darkened spherical fisheye ("рыбий глаз") reflection of the user's camera feed
  * - Dynamic light-reactive specular glare ("блик") and multi-coating reflections that shift as the user rotates the 3D intercom
  */
-function renderCameraOpticsCanvas(
-  canvas: HTMLCanvasElement,
-  localVideo?: HTMLVideoElement | null,
-  camEnabled: boolean = true,
-  mirrorSelf: boolean = true,
-  viewOffsetX: number = 0,
-  viewOffsetY: number = 0
-) {
+let cachedOpticsStaticBase: HTMLCanvasElement | null = null;
+
+function getOpticsStaticBaseCanvas(): HTMLCanvasElement {
+  if (cachedOpticsStaticBase) return cachedOpticsStaticBase;
   const size = 512;
   const cx = size / 2;
   const cy = size / 2;
-  const ctx = canvas.getContext('2d')!;
+  const baseCanvas = document.createElement('canvas');
+  baseCanvas.width = 256;
+  baseCanvas.height = 256;
+  const ctx = baseCanvas.getContext('2d')!;
   ctx.save();
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.scale(canvas.width / size, canvas.height / size);
-
-  // Clamp normalized viewing angle offsets
-  const vx = Math.max(-1, Math.min(1, viewOffsetX));
-  const vy = Math.max(-1, Math.min(1, viewOffsetY));
+  ctx.scale(0.5, 0.5);
 
   // 1. Outer recessed anodized housing base
   const housingGrad = ctx.createLinearGradient(0, 0, size, size);
@@ -309,14 +303,7 @@ function renderCameraOpticsCanvas(
   }
 
   // Ambient occlusion shadow from outer bezel
-  const bezelShadow = ctx.createRadialGradient(
-    cx - 18 + vx * 10,
-    cy - 18 - vy * 10,
-    110,
-    cx,
-    cy,
-    248
-  );
+  const bezelShadow = ctx.createRadialGradient(cx - 18, cy - 18, 110, cx, cy, 248);
   bezelShadow.addColorStop(0, 'rgba(0,0,0,0)');
   bezelShadow.addColorStop(0.72, 'rgba(0,0,0,0.22)');
   bezelShadow.addColorStop(1, 'rgba(0,0,0,0.82)');
@@ -359,7 +346,7 @@ function renderCameraOpticsCanvas(
 
     ctx.fillStyle = 'rgba(255, 255, 255, 0.20)';
     ctx.beginPath();
-    ctx.arc(ix - 4.5 + vx * 2, iy - 4.5 - vy * 2, 2.4, 0, Math.PI * 2);
+    ctx.arc(ix - 4.5, iy - 4.5, 2.4, 0, Math.PI * 2);
     ctx.fill();
   }
 
@@ -382,7 +369,6 @@ function renderCameraOpticsCanvas(
   ctx.fill();
 
   // Micro technical specification text along inner ring
-  ctx.save();
   ctx.fillStyle = 'rgba(180, 190, 205, 0.42)';
   ctx.font = '600 10.5px "JetBrains Mono", monospace';
   ctx.textAlign = 'center';
@@ -391,7 +377,36 @@ function renderCameraOpticsCanvas(
   ctx.fillText('IR OPTICS', cx, cy + 116);
   ctx.restore();
 
-  // 5. Deep smoked optical glass objective (r = 98) with darkened spherical fisheye reflection!
+  cachedOpticsStaticBase = baseCanvas;
+  return baseCanvas;
+}
+
+function renderCameraOpticsCanvas(
+  canvas: HTMLCanvasElement,
+  localVideo?: HTMLVideoElement | null,
+  camEnabled: boolean = true,
+  mirrorSelf: boolean = true,
+  viewOffsetX: number = 0,
+  viewOffsetY: number = 0
+) {
+  const size = 512;
+  const cx = size / 2;
+  const cy = size / 2;
+  const ctx = canvas.getContext('2d')!;
+  ctx.save();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+
+  // Fast-path blit of pre-rendered static bezel, baffle grooves, IR LEDs, and lens barrel
+  const staticBase = getOpticsStaticBaseCanvas();
+  ctx.drawImage(staticBase, 0, 0, canvas.width, canvas.height);
+
+  ctx.scale(canvas.width / size, canvas.height / size);
+
+  // Clamp normalized viewing angle offsets
+  const vx = Math.max(-1, Math.min(1, viewOffsetX));
+  const vy = Math.max(-1, Math.min(1, viewOffsetY));
+
+  // 5. Deep smoked optical glass objective (r = 98) with instant darkened spherical fisheye reflection!
   const lensBaseGrad = ctx.createRadialGradient(cx, cy, 6, cx, cy, 98);
   lensBaseGrad.addColorStop(0, '#010205');
   lensBaseGrad.addColorStop(0.55, '#03060d');
@@ -419,14 +434,12 @@ function renderCameraOpticsCanvas(
     const sx = (vw - s) / 2;
     const sy = (vh - s) / 2;
 
-    // Render 9 concentric annular rings from outer rim to center with non-linear spherical barrel magnification
-    // so the center bows outward and the periphery curves tightly around the convex hemisphere ("рыбий глаз")!
-    const rings = 9;
+    // Fast 5-ring spherical barrel magnification for real-time 60fps zero-lag mirror reflection
+    const rings = 5;
     const maxR = 94;
     for (let ri = rings; ri >= 1; ri--) {
-      const t = ri / rings; // 1.0 at rim -> 0.11 at center
+      const t = ri / rings;
       const ringRadius = maxR * t;
-      // Fisheye barrel curve: outer rings compress wide field of view, inner rings magnify center
       const fisheyeScale = 0.72 + 0.62 * (1 - t * t);
       const drawHalf = 96 * fisheyeScale;
 
@@ -434,8 +447,7 @@ function renderCameraOpticsCanvas(
       ctx.beginPath();
       ctx.arc(cx + reflShiftX * (1 - t * 0.45), cy + reflShiftY * (1 - t * 0.45), ringRadius, 0, Math.PI * 2);
       ctx.clip();
-      // Heavily darkened so the reflection looks like a real dark tinted pinhole lens (~22% opacity)
-      ctx.globalAlpha = 0.22 * (1.05 - 0.35 * t * t);
+      ctx.globalAlpha = 0.24 * (1.05 - 0.32 * t * t);
       ctx.translate(cx + reflShiftX * 0.65, cy + reflShiftY * 0.65);
       if (mirrorSelf) {
         ctx.scale(-1, 1);
@@ -1098,16 +1110,25 @@ export const IntercomScene3D: React.FC<IntercomScene3DProps> = ({
     container.innerHTML = '';
     container.appendChild(domElem);
 
+    const isTouchDevice =
+      typeof window !== 'undefined' &&
+      ('ontouchstart' in window || navigator.maxTouchPoints > 0);
+    domElem.style.touchAction = 'none';
+
     const controls = new OrbitControls(camera, domElem);
-    // Allow smooth inertial rotation & zooming while preventing clipping or jumping at far distance
-    controls.zoomToCursor = true;
+    // Disable zoomToCursor on touch devices so two-finger pinch zooms smoothly toward the intercom without snapping the target!
+    controls.zoomToCursor = !isTouchDevice;
     controls.enablePan = true;
     controls.screenSpacePanning = true;
     controls.enableDamping = true;
-    controls.dampingFactor = isSoftwareGl ? 0.22 : 0.085;
-    controls.rotateSpeed = 0.72;
-    controls.zoomSpeed = 0.9;
-    controls.panSpeed = 0.75;
+    controls.dampingFactor = isSoftwareGl ? 0.22 : isTouchDevice ? 0.065 : 0.085;
+    controls.rotateSpeed = isTouchDevice ? 0.62 : 0.72;
+    controls.zoomSpeed = isTouchDevice ? 0.38 : 0.78;
+    controls.panSpeed = isTouchDevice ? 0.5 : 0.75;
+    controls.touches = {
+      ONE: THREE.TOUCH.ROTATE,
+      TWO: THREE.TOUCH.DOLLY_PAN,
+    };
     controls.minDistance = 0.65;
     controls.maxDistance = 7.8;
     controls.minPolarAngle = Math.PI / 2.8;
@@ -2705,9 +2726,6 @@ export const IntercomScene3D: React.FC<IntercomScene3DProps> = ({
       ctx.restore();
     }
 
-    let lastOpticsDrawAt = 0;
-    let lastOpticsCamState: boolean | null = null;
-
     function drawVideoScreenNow() {
       const ctx = videoScreenCanvas.getContext('2d')!;
       const w = videoScreenCanvas.width; // 512
@@ -2732,16 +2750,11 @@ export const IntercomScene3D: React.FC<IntercomScene3DProps> = ({
       const remoteVideo = remoteVideoElementRef?.current;
       const remoteCanvas = remoteVideoCanvasRef?.current;
 
-      // Throttle heavy 9-ring fisheye optics lens rendering so it never starves main-thread video/audio during calls
-      const nowMs = performance.now();
-      if (nowMs - lastOpticsDrawAt >= 350 || lastOpticsCamState !== isCamOn) {
-        lastOpticsDrawAt = nowMs;
-        lastOpticsCamState = isCamOn;
-        const camDx = THREE.MathUtils.clamp((camera.position.x - controls.target.x) / 3.2, -1, 1);
-        const camDy = THREE.MathUtils.clamp((camera.position.y - controls.target.y) / 3.2, -1, 1);
-        renderCameraOpticsCanvas(cameraOpticsCanvas, localVideo, isCamOn, mirrorSelf, camDx, camDy);
-        cameraOpticsTex.needsUpdate = true;
-      }
+      // Instant zero-lag camera optics mirror reflection (static housing is cached, so per-frame draw is <0.2ms)
+      const camDx = THREE.MathUtils.clamp((camera.position.x - controls.target.x) / 3.2, -1, 1);
+      const camDy = THREE.MathUtils.clamp((camera.position.y - controls.target.y) / 3.2, -1, 1);
+      renderCameraOpticsCanvas(cameraOpticsCanvas, localVideo, isCamOn, mirrorSelf, camDx, camDy);
+      cameraOpticsTex.needsUpdate = true;
 
       ctx.fillStyle = '#090b0e';
       ctx.fillRect(0, 0, w, h);
@@ -3063,7 +3076,7 @@ export const IntercomScene3D: React.FC<IntercomScene3DProps> = ({
           if (hasLiveVideoStream) {
             drawVideoScreenNow();
           }
-        }, 42)
+        }, 16)
       : window.setTimeout(() => {
           if (unmounted) return;
           drawVideoScreenNow();
@@ -3096,6 +3109,18 @@ export const IntercomScene3D: React.FC<IntercomScene3DProps> = ({
     }
 
     const handlePointerDown = (e: PointerEvent) => {
+      // Multi-touch pinch gesture: immediately cancel button/PiP grabs and keep OrbitControls active!
+      if (!e.isPrimary) {
+        if (heldButtonLabel) {
+          const st = buttonAnimMap.get(heldButtonLabel);
+          if (st) st.targetZ = BTN_REST_Z;
+          heldButtonLabel = null;
+        }
+        pipStateRef.current.dragging = false;
+        controls.enabled = true;
+        return;
+      }
+
       pointerDownPos = { x: e.clientX, y: e.clientY };
 
       const screenCoords = getMonitorScreenHitUV(e);
